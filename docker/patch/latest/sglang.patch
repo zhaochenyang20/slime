@@ -130,3 +130,34 @@ index 50ac39f88..33782a8cd 100644
  
      async def update_weights_from_tensor(
          self,
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index ee83c2d9c..5145d7f78 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -22,6 +22,7 @@ import os
+ import time
+ from dataclasses import dataclass
+ from typing import List, Optional, Tuple, Union
++from contextlib import nullcontext
+ 
+ import torch
+ import torch.distributed as dist
+@@ -667,7 +668,7 @@ class ModelRunner:
+         monkey_patch_vllm_parallel_state()
+         monkey_patch_isinstance_for_vllm_base_layer()
+ 
+-        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_WEIGHTS):
++        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_WEIGHTS) if not self.is_draft_worker else nullcontext():
+             self.model = get_model(
+                 model_config=self.model_config,
+                 load_config=self.load_config,
+diff --git a/python/sglang/srt/models/glm4_moe.py b/python/sglang/srt/models/glm4_moe.py
+index 67ef6ca79..1a3db9974 100644
+--- a/python/sglang/srt/models/glm4_moe.py
++++ b/python/sglang/srt/models/glm4_moe.py
+@@ -1108,5 +1108,4 @@ class Glm4MoeForCausalLM(DeepseekV2ForCausalLM):
+                         )
+                         weight_loader(param, loaded_weight)
+ 
+-
+ EntryClass = [Glm4MoeForCausalLM]
