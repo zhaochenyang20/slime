@@ -133,7 +133,7 @@ def is_wandb_offline():
 def get_wandb_offline_dir(args=None):
     """Get the directory where offline W&B data is stored."""
     if is_wandb_offline():
-        if args and hasattr(args, 'wandb_dir') and args.wandb_dir:
+        if args and hasattr(args, "wandb_dir") and args.wandb_dir:
             # Use custom directory if specified
             return args.wandb_dir
         else:
