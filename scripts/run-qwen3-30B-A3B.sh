@@ -42,18 +42,18 @@ ROLLOUT_ARGS=(
    --apply-chat-template
    --rollout-shuffle
    --rm-type deepscaler
-   --num-rollout 100
-   --rollout-batch-size 16
-   --n-samples-per-prompt 4
+   --num-rollout 3000
+   --rollout-batch-size 32
+   --n-samples-per-prompt 8
    --rollout-max-response-len 8192
    --rollout-temperature 0.8
 
-   --global-batch-size 64
+   --global-batch-size 256
    --balance-data
 )
 
 EVAL_ARGS=(
-   # --eval-interval 20
+   --eval-interval 20
    --eval-prompt-data aime /root/aime-2024/aime-2024.jsonl
    --n-samples-per-eval-prompt 16
    --eval-max-response-len 16384
@@ -101,10 +101,10 @@ OPTIMIZER_ARGS=(
 )
 
 WANDB_ARGS=(
-   --use-wandb
-   --wandb-project slime-dev
-   --wandb-group qwen3-30B-A3B-test
-   --wandb-key ${WANDB_KEY}
+   #--use-wandb
+   # --wandb-project slime-dev
+   # --wandb-group qwen3-30B-A3B-test
+   # --wandb-key ${WANDB_KEY}
 )
 
 SGLANG_ARGS=(
