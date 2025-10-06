@@ -1,5 +1,6 @@
-import torch
 from typing import Any, Dict, Optional, Tuple
+
+import torch
 
 
 def masked_sum(x: torch.Tensor, mask: torch.Tensor, dim: int = -1) -> torch.Tensor:
@@ -84,7 +85,9 @@ def compute_is_metrics(
     if is_weights.dim() > 1 and eos_mask.any():
         seq_mean = masked_mean(is_weights, eos_mask, dim=-1)
         metrics["tis_seq_mean"] = seq_mean.mean()
-        metrics["tis_seq_std"] = seq_mean.std() if seq_mean.numel() > 1 else torch.tensor(0.0, device=is_weights.device)
+        metrics["tis_seq_std"] = (
+            seq_mean.std() if seq_mean.numel() > 1 else torch.tensor(0.0, device=is_weights.device)
+        )
         metrics["tis_seq_max"] = seq_mean.max()
         metrics["tis_seq_min"] = seq_mean.min()
         seq_dev = (seq_mean - 1.0).abs()
@@ -200,5 +203,3 @@ def compute_tis_weights(
     )
 
     return weights, metrics
-
-
