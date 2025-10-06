@@ -9,6 +9,7 @@ pkill -9 python
 sleep 3
 pkill -9 ray
 pkill -9 python
+pkill -9 redis
 
 set -ex
 
@@ -85,6 +86,7 @@ GRPO_ARGS=(
    --entropy-coef 0.00
    --eps-clip 0.2
    --eps-clip-high 0.28
+   --use-tis
 )
 
 OPTIMIZER_ARGS=(

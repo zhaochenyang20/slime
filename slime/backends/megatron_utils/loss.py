@@ -14,6 +14,7 @@ from slime.utils.ppo_utils import (
     get_reinforce_plus_plus_baseline_advantages,
     get_reinforce_plus_plus_returns,
 )
+from slime.utils.tis import compute_tis_weights
 
 from .cp_utils import all_gather_with_cp, get_logits_and_tokens_offset_with_cp, get_sum_of_sample_mean
 
@@ -308,14 +309,36 @@ def policy_loss_function(args, batch, logits, sum_of_sample_mean):
     if args.use_tis:
         assert "rollout_log_probs" in batch, "rollout_log_probs must be provided for TIS"
         rollout_log_probs = torch.cat(batch["rollout_log_probs"], dim=0)
-        old_log_probs = torch.cat(batch["log_probs"], dim=0)
+        old_log_probs_flat = torch.cat(batch["log_probs"], dim=0)
 
-        tis = torch.exp(old_log_probs - rollout_log_probs)
+        # Build eos mask from loss masks (concatenated) to match flattened tensors
+        eos_mask = torch.cat(batch["loss_masks"], dim=0).to(device=log_probs.device)
+
+        # Backward compatible thresholds
+        upper = args.tis_threshold if getattr(args, "tis_threshold", None) is not None else args.tis_clip
+        lower = (
+            args.tis_threshold_lower
+            if getattr(args, "tis_threshold_lower", None) is not None
+            else getattr(args, "tis_clip_low", 0.0)
+        )
+
+        tis_weights, tis_metrics = compute_tis_weights(
+            old_log_prob=old_log_probs_flat,
+            rollout_log_prob=rollout_log_probs,
+            eos_mask=eos_mask,
+            level=getattr(args, "tis_level", "token"),
+            mode=getattr(args, "tis_mode", "truncate"),
+            upper_threshold=upper,
+            lower_threshold=lower,
+            veto_threshold=getattr(args, "tis_veto_threshold", 1e-4),
+            safety_bound=getattr(args, "tis_safety_bound", 20.0),
+        )
+
+        # On-policy ratio for monitoring (π_new/π_old)
         ois = (-ppo_kl).exp()
-        tis_clip = torch.clamp(tis, min=args.tis_clip_low, max=args.tis_clip)
-        tis_clipfrac = tis_clip != tis
 
-        pg_loss = pg_loss * tis_clip
+        if tis_weights is not None:
+            pg_loss = pg_loss * tis_weights
 
     pg_loss = sum_of_sample_mean(pg_loss)
     pg_clipfrac = sum_of_sample_mean(pg_clipfrac)
@@ -356,9 +379,22 @@ def policy_loss_function(args, batch, logits, sum_of_sample_mean):
         reported_loss["kl_loss"] = kl_loss.clone().detach()
 
     if args.use_tis:
-        reported_loss["tis"] = sum_of_sample_mean(tis).clone().detach()
+        # Backward compatible basic logs
         reported_loss["ois"] = sum_of_sample_mean(ois).clone().detach()
-        reported_loss["tis_clipfrac"] = sum_of_sample_mean(tis_clipfrac).clone().detach()
+        # Extended metrics from generalized TIS
+        for k in [
+            "tis_mean",
+            "tis_std",
+            "tis_ratio_fraction_high",
+            "tis_ratio_fraction_low",
+            "tis_seq_clipped_fraction",
+            "tis_veto_fraction",
+        ]:
+            if k in tis_metrics:
+                val = tis_metrics[k]
+                reported_loss[k] = (
+                    val.clone().detach() if torch.is_tensor(val) else torch.tensor(val, device=logits.device)
+                )
 
     return loss, reported_loss
 

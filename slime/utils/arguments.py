@@ -654,6 +654,55 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Lower bound clipping threshold C for importance sampling ratios to control variance.",
             )
 
+            # Extended TIS controls (levels/modes/thresholds) with backward compatibility
+            parser.add_argument(
+                "--tis-level",
+                type=str,
+                choices=["token", "sequence", "geometric"],
+                default="token",
+                help=(
+                    "Aggregation level for importance sampling weights: token (per-token), "
+                    "sequence (product over tokens), geometric (geometric mean)."
+                ),
+            )
+            parser.add_argument(
+                "--tis-mode",
+                type=str,
+                choices=["truncate", "clip"],
+                default="truncate",
+                help=(
+                    "Handling mode for IS weights: truncate (cap upper bound, TIS) or clip "
+                    "(zero outside [lower, upper], CIS)."
+                ),
+            )
+            parser.add_argument(
+                "--tis-threshold",
+                type=float,
+                default=None,
+                help=("Upper threshold for IS weights. If not set, falls back to --tis-clip (default 2.0)."),
+            )
+            parser.add_argument(
+                "--tis-threshold-lower",
+                type=float,
+                default=None,
+                help=(
+                    "Lower threshold for IS weights. If not set: for clip mode uses reciprocal of upper; "
+                    "for truncate mode remains unused. If --tis-clip-low provided, that will be used when applicable."
+                ),
+            )
+            parser.add_argument(
+                "--tis-veto-threshold",
+                type=float,
+                default=1e-4,
+                help=("Per-token veto threshold. If any token ratio < this, zero the entire sequence weight."),
+            )
+            parser.add_argument(
+                "--tis-safety-bound",
+                type=float,
+                default=20.0,
+                help=("Safety clamp for log-space ratio to avoid numerical overflow (exp(20) ~= 4.85e8)."),
+            )
+
             parser.add_argument(
                 "--use-routing-replay",
                 action="store_true",
