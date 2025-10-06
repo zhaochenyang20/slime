@@ -14,7 +14,7 @@ from slime.utils.ppo_utils import (
     get_reinforce_plus_plus_baseline_advantages,
     get_reinforce_plus_plus_returns,
 )
-from slime.utils.tis import compute_tis_weights
+from slime.utils.tis import compute_kl_metrics, compute_tis_weights
 
 from .cp_utils import all_gather_with_cp, get_logits_and_tokens_offset_with_cp, get_sum_of_sample_mean
 
@@ -309,7 +309,7 @@ def policy_loss_function(args, batch, logits, sum_of_sample_mean):
     if args.use_tis:
         assert "rollout_log_probs" in batch, "rollout_log_probs must be provided for TIS"
         rollout_log_probs = torch.cat(batch["rollout_log_probs"], dim=0)
-        old_log_probs_flat = torch.cat(batch["log_probs"], dim=0)
+        old_log_probs = torch.cat(batch["log_probs"], dim=0)
 
         # Build eos mask from loss masks (concatenated) to match flattened tensors
         eos_mask = torch.cat(batch["loss_masks"], dim=0).to(device=log_probs.device)
@@ -323,7 +323,7 @@ def policy_loss_function(args, batch, logits, sum_of_sample_mean):
         )
 
         tis_weights, tis_metrics = compute_tis_weights(
-            old_log_prob=old_log_probs_flat,
+            old_log_prob=old_log_probs,
             rollout_log_prob=rollout_log_probs,
             eos_mask=eos_mask,
             level=getattr(args, "tis_level", "token"),
@@ -339,6 +339,14 @@ def policy_loss_function(args, batch, logits, sum_of_sample_mean):
 
         if tis_weights is not None:
             pg_loss = pg_loss * tis_weights
+
+        # KL metrics next to TIS metrics
+        kl_metrics = compute_kl_metrics(
+            old_log_prob=old_log_probs,
+            rollout_log_prob=rollout_log_probs,
+            eos_mask=eos_mask,
+            response_lengths=batch["response_lengths"],
+        )
 
     pg_loss = sum_of_sample_mean(pg_loss)
     pg_clipfrac = sum_of_sample_mean(pg_clipfrac)
@@ -381,20 +389,9 @@ def policy_loss_function(args, batch, logits, sum_of_sample_mean):
     if args.use_tis:
         # Backward compatible basic logs
         reported_loss["ois"] = sum_of_sample_mean(ois).clone().detach()
-        # Extended metrics from generalized TIS
-        for k in [
-            "tis_mean",
-            "tis_std",
-            "tis_ratio_fraction_high",
-            "tis_ratio_fraction_low",
-            "tis_seq_clipped_fraction",
-            "tis_veto_fraction",
-        ]:
-            if k in tis_metrics:
-                val = tis_metrics[k]
-                reported_loss[k] = (
-                    val.clone().detach() if torch.is_tensor(val) else torch.tensor(val, device=logits.device)
-                )
+        # Report all TIS and KL metrics uniformly
+        for k, v in {**tis_metrics, **kl_metrics}.items():
+            reported_loss[k] = v.clone().detach() if torch.is_tensor(v) else torch.tensor(v, device=logits.device)
 
     return loss, reported_loss
 

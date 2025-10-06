@@ -18,13 +18,14 @@ else:
     raise ImportError("FSDP v2 not available")
 
 import wandb
+
 from slime.ray.train_actor import TrainRayActor
 from slime.utils.data import get_minimum_num_micro_batch_size, process_rollout_data
 from slime.utils.distributed_utils import get_gloo_group
 from slime.utils.memory_utils import clear_memory
 from slime.utils.ppo_utils import compute_approx_kl, compute_policy_loss
 from slime.utils.timer import Timer, timer
-from slime.utils.tis import compute_tis_weights
+from slime.utils.tis import compute_kl_metrics, compute_tis_weights
 from slime.utils.wandb_utils import init_wandb_secondary
 
 from .data_packing import pack_sequences, unpack_sequences
@@ -336,7 +337,6 @@ class FSDPTrainRayActor(TrainRayActor):
                 rollout_log_probs = torch.cat([batch["rollout_log_probs"] for batch in unpacked_batches], dim=0).to(
                     device=log_probs.device
                 )
-                old_log_probs_flat = old_log_probs
 
                 # Build eos mask from loss masks
                 eos_mask = torch.cat(loss_masks, dim=0).to(device=log_probs.device)
@@ -349,7 +349,7 @@ class FSDPTrainRayActor(TrainRayActor):
                     lower = getattr(self.args, "tis_clip_low", 0.0)
 
                 tis_weights, tis_metrics = compute_tis_weights(
-                    old_log_prob=old_log_probs_flat,
+                    old_log_prob=old_log_probs,
                     rollout_log_prob=rollout_log_probs,
                     eos_mask=eos_mask,
                     level=getattr(self.args, "tis_level", "token"),
@@ -364,6 +364,14 @@ class FSDPTrainRayActor(TrainRayActor):
 
                 if tis_weights is not None:
                     pg_loss = pg_loss * tis_weights
+
+                # KL metrics next to TIS metrics
+                kl_metrics = compute_kl_metrics(
+                    old_log_prob=old_log_probs,
+                    rollout_log_prob=rollout_log_probs,
+                    eos_mask=eos_mask,
+                    response_lengths=response_lengths,
+                )
 
             pg_loss = sum_of_sample_mean(pg_loss, response_lengths, loss_masks)
             pg_clipfrac = sum_of_sample_mean(pg_clipfrac, response_lengths, loss_masks)
@@ -399,20 +407,9 @@ class FSDPTrainRayActor(TrainRayActor):
 
             if self.args.use_tis and tis_weights is not None:
                 reported["ois"] = sum_of_sample_mean(ois, response_lengths, loss_masks).detach()
-                # Extended metrics
-                for k in [
-                    "tis_mean",
-                    "tis_std",
-                    "tis_ratio_fraction_high",
-                    "tis_ratio_fraction_low",
-                    "tis_seq_clipped_fraction",
-                    "tis_veto_fraction",
-                ]:
-                    if k in tis_metrics:
-                        val = tis_metrics[k]
-                        reported[k] = (
-                            val.detach() if torch.is_tensor(val) else torch.tensor(val, device=log_probs.device)
-                        )
+                # Report all TIS and KL metrics uniformly
+                for k, v in {**tis_metrics, **kl_metrics}.items():
+                    reported[k] = v.detach() if torch.is_tensor(v) else torch.tensor(v, device=log_probs.device)
 
             # Scale loss for gradient accumulation
             loss = loss * dist.get_world_size() / self.args.global_batch_size

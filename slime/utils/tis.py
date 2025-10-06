@@ -107,6 +107,55 @@ def compute_is_metrics(
     return metrics
 
 
+def compute_kl_metrics(
+    *,
+    old_log_prob: torch.Tensor,
+    rollout_log_prob: torch.Tensor,
+    eos_mask: Optional[torch.Tensor],
+    response_lengths: Optional[list[int]] = None,
+) -> Dict[str, Any]:
+    metrics: Dict[str, Any] = {}
+
+    device = old_log_prob.device
+    if eos_mask is None:
+        eos_mask = torch.ones_like(old_log_prob, dtype=torch.bool, device=device)
+
+    # Direct estimator for KL(pi_rollout || pi_old): E[log pi_rollout - log pi_old]
+    metrics["rollout_kl"] = masked_mean(rollout_log_prob - old_log_prob, eos_mask)
+
+    # K3 estimator: E[exp(log(pi_old/pi_rollout)) - log(pi_old/pi_rollout) - 1]
+    log_ratio = old_log_prob - rollout_log_prob
+    k3_matrix = torch.exp(log_ratio) - log_ratio - 1
+    metrics["rollout_k3_kl"] = masked_mean(k3_matrix, eos_mask)
+
+    # Sequence-level perplexity difference metrics
+    if old_log_prob.dim() == 2:
+        mean_log_prob_rollout_per_seq = masked_mean(rollout_log_prob, eos_mask, dim=-1)
+        mean_log_prob_old_per_seq = masked_mean(old_log_prob, eos_mask, dim=-1)
+    elif response_lengths is not None and len(response_lengths) > 0 and old_log_prob.dim() == 1:
+        seq_rollout_means = []
+        seq_old_means = []
+        start = 0
+        for length in response_lengths:
+            end = start + int(length)
+            mask_chunk = eos_mask[start:end] if eos_mask is not None else None
+            seq_rollout_means.append(masked_mean(rollout_log_prob[start:end], mask_chunk))
+            seq_old_means.append(masked_mean(old_log_prob[start:end], mask_chunk))
+            start = end
+        mean_log_prob_rollout_per_seq = torch.stack(seq_rollout_means)
+        mean_log_prob_old_per_seq = torch.stack(seq_old_means)
+    else:
+        # Fallback to global means if sequence boundaries are unavailable
+        mean_log_prob_rollout_per_seq = masked_mean(rollout_log_prob, eos_mask).unsqueeze(0)
+        mean_log_prob_old_per_seq = masked_mean(old_log_prob, eos_mask).unsqueeze(0)
+
+    diff = mean_log_prob_rollout_per_seq - mean_log_prob_old_per_seq
+    metrics["log_ppl_diff"] = diff.mean()
+    metrics["log_ppl_abs_diff"] = diff.abs().mean()
+
+    return metrics
+
+
 def compute_tis_weights(
     *,
     old_log_prob: torch.Tensor,
