@@ -314,13 +314,9 @@ def policy_loss_function(args, batch, logits, sum_of_sample_mean):
         # Build eos mask from loss masks (concatenated) to match flattened tensors
         eos_mask = torch.cat(batch["loss_masks"], dim=0).to(device=log_probs.device)
 
-        # Backward compatible thresholds
-        upper = args.tis_threshold if getattr(args, "tis_threshold", None) is not None else args.tis_clip
-        lower = (
-            args.tis_threshold_lower
-            if getattr(args, "tis_threshold_lower", None) is not None
-            else getattr(args, "tis_clip_low", 0.0)
-        )
+        # Use the new threshold parameters
+        upper = args.tis_threshold_upper
+        lower = args.tis_threshold_lower
 
         tis_weights, tis_metrics = compute_tis_weights(
             old_log_prob=old_log_probs,
@@ -389,9 +385,13 @@ def policy_loss_function(args, batch, logits, sum_of_sample_mean):
     if args.use_tis:
         # Backward compatible basic logs
         reported_loss["ois"] = sum_of_sample_mean(ois).clone().detach()
-        # Report all TIS and KL metrics uniformly
+        # Report all TIS and KL metrics uniformly, filtering out non-numeric values
         for k, v in {**tis_metrics, **kl_metrics}.items():
-            reported_loss[k] = v.clone().detach() if torch.is_tensor(v) else torch.tensor(v, device=logits.device)
+            if torch.is_tensor(v):
+                reported_loss[k] = v.clone().detach()
+            elif isinstance(v, (int, float)):
+                reported_loss[k] = torch.tensor(v, device=logits.device)
+            # Skip string and other non-numeric types
 
     return loss, reported_loss
 

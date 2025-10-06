@@ -341,12 +341,8 @@ class FSDPTrainRayActor(TrainRayActor):
                 # Build eos mask from loss masks
                 eos_mask = torch.cat(loss_masks, dim=0).to(device=log_probs.device)
 
-                upper = getattr(self.args, "tis_threshold", None)
-                if upper is None:
-                    upper = getattr(self.args, "tis_clip", 2.0)
-                lower = getattr(self.args, "tis_threshold_lower", None)
-                if lower is None:
-                    lower = getattr(self.args, "tis_clip_low", 0.0)
+                upper = self.args.tis_threshold_upper
+                lower = self.args.tis_threshold_lower
 
                 tis_weights, tis_metrics = compute_tis_weights(
                     old_log_prob=old_log_probs,
@@ -407,9 +403,13 @@ class FSDPTrainRayActor(TrainRayActor):
 
             if self.args.use_tis and tis_weights is not None:
                 reported["ois"] = sum_of_sample_mean(ois, response_lengths, loss_masks).detach()
-                # Report all TIS and KL metrics uniformly
+                # Report all TIS and KL metrics uniformly, filtering out non-numeric values
                 for k, v in {**tis_metrics, **kl_metrics}.items():
-                    reported[k] = v.detach() if torch.is_tensor(v) else torch.tensor(v, device=log_probs.device)
+                    if torch.is_tensor(v):
+                        reported[k] = v.detach()
+                    elif isinstance(v, (int, float)):
+                        reported[k] = torch.tensor(v, device=log_probs.device)
+                    # Skip string and other non-numeric types
 
             # Scale loss for gradient accumulation
             loss = loss * dist.get_world_size() / self.args.global_batch_size

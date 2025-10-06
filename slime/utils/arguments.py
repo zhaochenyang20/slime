@@ -641,18 +641,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=False,
                 help="Enable TIS from https://fengyao.notion.site/off-policy-rl for off-policy importance sampling.",
             )
-            parser.add_argument(
-                "--tis-clip",
-                type=float,
-                default=2.0,
-                help="Clipping threshold C for importance sampling ratios to control variance.",
-            )
-            parser.add_argument(
-                "--tis-clip-low",
-                type=float,
-                default=0,
-                help="Lower bound clipping threshold C for importance sampling ratios to control variance.",
-            )
 
             # Extended TIS controls (levels/modes/thresholds) with backward compatibility
             parser.add_argument(
@@ -676,18 +664,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
-                "--tis-threshold",
+                "--tis-threshold-upper",
                 type=float,
-                default=None,
-                help=("Upper threshold for IS weights. If not set, falls back to --tis-clip (default 2.0)."),
+                default=2.0,
+                help=("Upper threshold for IS weights. Default is 2.0."),
             )
             parser.add_argument(
                 "--tis-threshold-lower",
                 type=float,
-                default=None,
+                default=0.0,
                 help=(
-                    "Lower threshold for IS weights. If not set: for clip mode uses reciprocal of upper; "
-                    "for truncate mode remains unused. If --tis-clip-low provided, that will be used when applicable."
+                    "Lower threshold for IS weights. Default is 0.0. "
+                    "For clip mode uses this value; for truncate mode remains unused."
                 ),
             )
             parser.add_argument(
