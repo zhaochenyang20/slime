@@ -7,7 +7,7 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   run-pre-commit:
@@ -36,26 +36,6 @@ jobs:
           restore-keys: |
             pre-commit-${{ runner.os }}-
 
-      - name: Run pre-commit (autofix pass)
-        id: autofix
-        run: |
-          set -e
-          pre-commit run --all-files --show-diff-on-failure --color=always || true
-          if [[ -n "$(git status --porcelain)" ]]; then
-            echo "changes=true" >> $GITHUB_OUTPUT
-          else
-            echo "changes=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Commit and push fixes
-        if: steps.autofix.outputs.changes == 'true' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -m "chore(pre-commit): apply autofixes"
-          git push
-
-      - name: Run pre-commit (verify pass)
+      - name: Run pre-commit on all files
         run: pre-commit run --all-files --show-diff-on-failure --color=always
 
