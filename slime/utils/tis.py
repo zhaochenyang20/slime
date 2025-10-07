@@ -71,18 +71,18 @@ def compute_tis_weights(
     if level == "token":
         #  Token-level IS: π_training(a|s) / π_rollout(a|s) per token
         # The truncation will be applied later.
-        log_ratio_for_metrics = log_ratio # [batch_size, seq_len]
+        log_ratio_for_metrics = log_ratio  # [batch_size, seq_len]
         log_ratio_safe = torch.clamp(log_ratio, min=-safety_bound, max=safety_bound)
         weights = torch.exp(log_ratio_safe)
     elif level == "sequence":
         # Sequence-level IS: π_training(a|s) / π_rollout(a|s) across the entire sequence
         log_ratio_sum = masked_sum(log_ratio, eos_mask, dim=-1).unsqueeze(-1)
-        log_ratio_for_metrics = log_ratio_sum # [batch_size, 1]
+        log_ratio_for_metrics = log_ratio_sum  # [batch_size, 1]
         log_ratio_sum_safe = torch.clamp(log_ratio_sum, min=-safety_bound, max=safety_bound)
         weights = torch.exp(log_ratio_sum_safe).expand_as(old_log_prob)
     elif level == "geometric":
         log_ratio_mean = masked_mean(log_ratio, eos_mask, dim=-1).unsqueeze(-1)
-        log_ratio_for_metrics = log_ratio_mean # [batch_size, 1]
+        log_ratio_for_metrics = log_ratio_mean  # [batch_size, 1]
         log_ratio_mean_safe = torch.clamp(log_ratio_mean, min=-safety_bound, max=safety_bound)
         weights = torch.exp(log_ratio_mean_safe).expand_as(old_log_prob)
     else:
@@ -92,8 +92,8 @@ def compute_tis_weights(
     # Veto sequences with any token's log ratio below the threshold.
     # log(π_training / π_rollout) < log(veto_threshold) ⟺ π_training / π_rollout < veto_threshold
     catastrophic_tokens = (log_ratio < log_veto_threshold) & eos_mask.bool()
-    has_catastrophic = catastrophic_tokens.any(dim=-1, keepdim=True) # [batch_size, 1]
-    veto_mask = (~has_catastrophic).float() # [batch_size, 1]
+    has_catastrophic = catastrophic_tokens.any(dim=-1, keepdim=True)  # [batch_size, 1]
+    veto_mask = (~has_catastrophic).float()  # [batch_size, 1]
 
     metrics = compute_is_metrics(
         is_weights=weights,
@@ -142,7 +142,6 @@ def compute_tis_weights(
     )
 
     return weights, metrics
-
 
 
 def compute_is_metrics(
@@ -283,4 +282,3 @@ def compute_kl_metrics(
     metrics["log_ppl_abs_diff"] = diff.abs().mean()
 
     return metrics
-
