@@ -4,23 +4,37 @@ import torch
 
 
 def masked_sum(x: torch.Tensor, mask: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    if mask is None:
-        return x.sum(dim=dim)
+    """
+    Computes the sum of the tensor x, masked by the mask.
+
+    x = [[1, 2, 3], [4, 5, 6]]
+    mask = [[1, 1, 1], [1, 1, 0]]
+    masked_sum(x, mask, dim=-1) = [6, 9]
+    """
+    valid_tokens = mask.sum(dim=dim)
+    assert valid_tokens.min() > 0, "any sequence must have at least one valid token"
+    assert x.shape == mask.shape, "x and mask must have the same shape"
     return (x * mask).sum(dim=dim)
 
 
 def masked_mean(x: torch.Tensor, mask: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    if mask is None:
-        return x.mean(dim=dim)
-    denom = mask.sum(dim=dim).clamp_min(1)
-    return masked_sum(x, mask, dim=dim) / denom
+    """
+    Computes the mean of the tensor x, masked by the mask.
+
+    x = [[1, 2, 3], [4, 5, 6]]
+    mask = [[1, 1, 1], [1, 1, 0]]
+    masked_mean(x, mask, dim=-1) = [2, 4.5]
+    """
+    valid_tokens = mask.sum(dim=dim)
+    assert valid_tokens.min() > 0, "any sequence must have at least one valid token"
+    return masked_sum(x, mask, dim=dim) / valid_tokens
 
 
 def compute_tis_weights(
     *,
     old_log_prob: torch.Tensor,
     rollout_log_prob: torch.Tensor,
-    eos_mask: Optional[torch.Tensor],
+    eos_mask: torch.Tensor,
     level: str = "token",
     mode: str = "truncate",
     upper_threshold: Optional[float] = None,
@@ -57,6 +71,10 @@ def compute_tis_weights(
         weights: The importance sampling weights. [batch_size, seq_len]
         metrics: The metrics for the importance sampling weights.
     """
+    assert (
+        eos_mask.shape == old_log_prob.shape and eos_mask.shape == rollout_log_prob.shape
+    ), "eos_mask, old_log_prob, and rollout_log_prob must have the same shape"
+
     if upper_threshold is None:
         return None, {}
     if lower_threshold is None:
@@ -95,8 +113,8 @@ def compute_tis_weights(
     has_catastrophic = catastrophic_tokens.any(dim=-1, keepdim=True)  # [batch_size, 1]
     veto_mask = (~has_catastrophic).float()  # [batch_size, 1]
 
-    metrics = compute_is_metrics(
-        is_weights=weights,
+    metrics = compute_tis_metrics(
+        tis_weights=weights,
         log_ratio_for_metrics=log_ratio_for_metrics,
         eos_mask=eos_mask,
         level=level,
@@ -133,106 +151,93 @@ def compute_tis_weights(
     weights = weights * eos_mask
     weights = weights.detach()
 
-    metrics.update(
-        {
-            "tis_threshold_upper": upper_threshold,
-            "tis_threshold_lower": lower_threshold,
-            "tis_level": level,
-            "tis_mode": mode,
-            "tis_veto_threshold": veto_threshold,
-        }
-    )
-
+    metrics["tis_threshold_upper"] = upper_threshold
+    metrics["tis_threshold_lower"] = lower_threshold
+    metrics["tis_level"] = level
+    metrics["tis_mode"] = mode
+    metrics["tis_veto_threshold"] = veto_threshold
     return weights, metrics
 
 
-def compute_is_metrics(
-    is_weights: torch.Tensor,
-    log_ratio_for_metrics: torch.Tensor,
-    eos_mask: Optional[torch.Tensor],
+def compute_tis_metrics(
     *,
+    tis_weights: torch.Tensor,
+    log_ratio_for_metrics: torch.Tensor,
+    eos_mask: torch.Tensor,
     level: str,
     upper_threshold: float,
     lower_threshold: float,
     log_upper_threshold: torch.Tensor,
     log_lower_threshold: torch.Tensor,
-    has_catastrophic: Optional[torch.Tensor],
-    catastrophic_tokens: Optional[torch.Tensor],
+    has_catastrophic: torch.Tensor,
+    catastrophic_tokens: torch.Tensor,
     safety_bound: float,
 ) -> Dict[str, Any]:
+    """
+    Computes metrics that reflect the TRUE distribution (before clamping)
+    for the truncated importance sampling (TIS) weights.
+    """
     metrics: Dict[str, Any] = {}
 
-    if eos_mask is None:
-        eos_mask = torch.ones_like(is_weights, dtype=torch.bool)
+    assert eos_mask.shape == tis_weights.shape, "eos_mask and tis_weights must have the same shape"
 
-    device = is_weights.device
-
-    if has_catastrophic is not None:
-        metrics["tis_veto_fraction"] = has_catastrophic.float().mean()
-    if catastrophic_tokens is not None and eos_mask is not None:
-        metrics["tis_catastrophic_token_fraction"] = masked_mean(catastrophic_tokens.float(), eos_mask)
+    metrics["tis_veto_fraction"] = has_catastrophic.float().mean()
+    metrics["tis_catastrophic_token_fraction"] = masked_mean(catastrophic_tokens.float(), eos_mask)
+    metrics["tis_level"] = level
+    metrics["tis_upper_threshold"] = upper_threshold
+    metrics["tis_lower_threshold"] = lower_threshold
+    metrics["tis_log_upper_threshold"] = log_upper_threshold
+    metrics["tis_log_lower_threshold"] = log_lower_threshold
+    metrics["tis_safety_bound"] = safety_bound
 
     if level in ["sequence", "geometric"]:
         log_max = log_ratio_for_metrics.max()
         log_min = log_ratio_for_metrics.min()
         metrics["tis_max"] = torch.exp(torch.clamp(log_max, max=safety_bound))
         metrics["tis_min"] = torch.exp(log_min)
-        metrics["tis_mean"] = masked_mean(is_weights, eos_mask)
+        metrics["tis_mean"] = masked_mean(tis_weights, eos_mask)
         exceeds_upper = log_ratio_for_metrics > log_upper_threshold
         below_lower = log_ratio_for_metrics < log_lower_threshold
         if level == "sequence":
-            metrics["tis_ratio_fraction_high"] = exceeds_upper.float().mean()
-            metrics["tis_ratio_fraction_low"] = below_lower.float().mean()
+            metrics["tis_ratio_fraction_exceeds_upper"] = exceeds_upper.float().mean()
+            metrics["tis_ratio_fraction_below_lower"] = below_lower.float().mean()
         else:
             exceeds_upper_exp = exceeds_upper.expand_as(eos_mask)
             below_lower_exp = below_lower.expand_as(eos_mask)
-            metrics["tis_ratio_fraction_high"] = masked_mean(exceeds_upper_exp.float(), eos_mask)
-            metrics["tis_ratio_fraction_low"] = masked_mean(below_lower_exp.float(), eos_mask)
+            metrics["tis_ratio_fraction_exceeds_upper"] = masked_mean(exceeds_upper_exp.float(), eos_mask)
+            metrics["tis_ratio_fraction_below_lower"] = masked_mean(below_lower_exp.float(), eos_mask)
     else:
-        metrics["tis_mean"] = masked_mean(is_weights, eos_mask)
-        above = is_weights > upper_threshold
-        below = is_weights < lower_threshold
-        metrics["tis_ratio_fraction_high"] = masked_mean(above.float(), eos_mask)
-        metrics["tis_ratio_fraction_low"] = masked_mean(below.float(), eos_mask)
-        if eos_mask.any():
-            mask_bool = eos_mask.bool()
-            metrics["tis_max"] = is_weights.masked_fill(~mask_bool, float("-inf")).max()
-            metrics["tis_min"] = is_weights.masked_fill(~mask_bool, float("inf")).min()
-        else:
-            metrics["tis_max"] = torch.tensor(0.0, device=device)
-            metrics["tis_min"] = torch.tensor(0.0, device=device)
+        metrics["tis_mean"] = masked_mean(tis_weights, eos_mask)
+        exceeds_upper = tis_weights > upper_threshold
+        below_lower = tis_weights < lower_threshold
+        metrics["tis_ratio_fraction_exceeds_upper"] = masked_mean(exceeds_upper.float(), eos_mask)
+        metrics["tis_ratio_fraction_below_lower"] = masked_mean(below_lower.float(), eos_mask)
+        valid = eos_mask.bool()
+        metrics["tis_max"] = tis_weights[valid].max()
+        metrics["tis_min"] = tis_weights[valid].min()
 
-    if eos_mask.any():
-        weights_for_std = is_weights.clamp(min=lower_threshold, max=upper_threshold)
-        var = masked_mean(weights_for_std.square(), eos_mask) - metrics["tis_mean"].square()
-        metrics["tis_std"] = torch.sqrt(torch.clamp(var, min=0.0))
-        weights_for_ess = weights_for_std / (metrics["tis_mean"] + 1e-8)
-        metrics["tis_eff_sample_size"] = 1.0 / masked_mean(weights_for_ess.square(), eos_mask)
-    else:
-        metrics["tis_std"] = torch.tensor(0.0, device=device)
-        metrics["tis_eff_sample_size"] = torch.tensor(1.0, device=device)
+    weights_for_std = tis_weights.clamp(min=lower_threshold, max=upper_threshold)
+    var = masked_mean(weights_for_std.square(), eos_mask) - metrics["tis_mean"].square()
+    metrics["tis_std"] = torch.sqrt(torch.clamp(var, min=0.0))
+    weights_for_ess = weights_for_std / (metrics["tis_mean"] + 1e-8)
+    metrics["tis_eff_sample_size"] = 1.0 / masked_mean(weights_for_ess.square(), eos_mask)
 
-    if is_weights.dim() > 1 and eos_mask.any():
-        seq_mean = masked_mean(is_weights, eos_mask, dim=-1)
-        metrics["tis_seq_mean"] = seq_mean.mean()
-        metrics["tis_seq_std"] = (
-            seq_mean.std() if seq_mean.numel() > 1 else torch.tensor(0.0, device=is_weights.device)
-        )
-        metrics["tis_seq_max"] = seq_mean.max()
-        metrics["tis_seq_min"] = seq_mean.min()
-        seq_dev = (seq_mean - 1.0).abs()
-        metrics["tis_seq_max_deviation"] = seq_dev.max()
-        metrics["tis_seq_fraction_high"] = (seq_mean > upper_threshold).float().mean()
-        metrics["tis_seq_fraction_low"] = (seq_mean < 1.0 / upper_threshold).float().mean()
+    seq_mean = masked_mean(tis_weights, eos_mask, dim=-1)
+    metrics["tis_seq_mean"] = seq_mean.mean()
+    metrics["tis_seq_std"] = seq_mean.std()
+    metrics["tis_seq_max"] = seq_mean.max()
+    metrics["tis_seq_min"] = seq_mean.min()
+    seq_dev = (seq_mean - 1.0).abs()
+    metrics["tis_seq_max_deviation"] = seq_dev.max()
+    metrics["tis_seq_fraction_exceeds_upper"] = (seq_mean > upper_threshold).float().mean()
+    metrics["tis_seq_fraction_below_lower"] = (seq_mean < lower_threshold).float().mean()
 
-    if eos_mask.any():
-        flat = is_weights[eos_mask.bool()]
-        if flat.numel() > 0:
-            metrics["tis_p25"] = torch.quantile(flat, 0.25)
-            metrics["tis_p50"] = torch.quantile(flat, 0.50)
-            metrics["tis_p75"] = torch.quantile(flat, 0.75)
-            metrics["tis_p95"] = torch.quantile(flat, 0.95)
-            metrics["tis_p99"] = torch.quantile(flat, 0.99)
+    flat = tis_weights[eos_mask.bool()]
+    metrics["tis_p25"] = torch.quantile(flat, 0.25)
+    metrics["tis_p50"] = torch.quantile(flat, 0.50)
+    metrics["tis_p75"] = torch.quantile(flat, 0.75)
+    metrics["tis_p95"] = torch.quantile(flat, 0.95)
+    metrics["tis_p99"] = torch.quantile(flat, 0.99)
 
     return metrics
 
