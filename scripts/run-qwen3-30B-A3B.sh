@@ -87,7 +87,7 @@ GRPO_ARGS=(
    --eps-clip 0.2
    --eps-clip-high 0.28
    --use-tis
-   --tis-level sequence
+   --tis-level geometric
 )
 
 OPTIMIZER_ARGS=(
@@ -107,6 +107,7 @@ WANDB_ARGS=(
    --use-wandb
    --wandb-project slime-dev
    --wandb-group qwen3-30B-A3B-TIS
+   --wandb-run-id qwen3-30B-A3B-TIS-sequence
    --wandb-key ${WANDB_KEY}
 )
 
