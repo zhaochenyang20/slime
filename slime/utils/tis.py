@@ -110,20 +110,22 @@ def compute_tis_weights(
     )
 
     if mode == "truncate":
+        # only truncate the weights at the upper threshold
         weights = weights.clamp(max=upper_threshold)
     elif mode == "clip":
-        clip_mask = (weights >= lower_threshold) & (weights <= upper_threshold)
-        clip_mask_f = clip_mask.float()
-        metrics["tis_clipped_fraction"] = masked_mean(1 - clip_mask_f, eos_mask)
+        # zero the weights outside the [lower, upper] range
         if level in ["sequence", "geometric"]:
-            seq_w = weights[:, 0] if weights.dim() > 1 else weights
-            seq_clipped = ((seq_w < lower_threshold) | (seq_w > upper_threshold)).float()
-            metrics["tis_seq_clipped_fraction"] = seq_clipped.mean()
+            seq_weights = weights[:, 0] if weights.dim() > 1 else weights
+            sequence_clipped = ((seq_weights < lower_threshold) | (seq_weights > upper_threshold)).float()
+            metrics["tis_sequence_clipped_fraction"] = sequence_clipped.mean()
         else:
-            clipped_indicator = 1 - clip_mask_f
-            seq_has_clipped = masked_sum(clipped_indicator, eos_mask, dim=-1) > 0
-            metrics["tis_seq_clipped_fraction"] = seq_has_clipped.float().mean()
-        weights = weights * clip_mask_f
+            clip_mask = (weights >= lower_threshold) & (weights <= upper_threshold)
+            clip_mask = clip_mask.float()
+            clipped_indicator = 1 - clip_mask
+            metrics["tis_token_clipped_fraction"] = masked_mean(clipped_indicator, eos_mask)
+            sequence_has_clipped = masked_sum(clipped_indicator, eos_mask, dim=-1) > 0
+            metrics["tis_sequence_clipped_fraction"] = sequence_has_clipped.float().mean()
+        weights = weights * clip_mask
     else:
         raise ValueError(f"Invalid tis mode: {mode}")
 

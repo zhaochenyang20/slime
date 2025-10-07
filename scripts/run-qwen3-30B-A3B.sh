@@ -87,6 +87,7 @@ GRPO_ARGS=(
    --eps-clip 0.2
    --eps-clip-high 0.28
    --use-tis
+   --tis-level sequence
 )
 
 OPTIMIZER_ARGS=(
