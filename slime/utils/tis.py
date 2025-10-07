@@ -16,6 +16,135 @@ def masked_mean(x: torch.Tensor, mask: torch.Tensor, dim: int = -1) -> torch.Ten
     return masked_sum(x, mask, dim=dim) / denom
 
 
+def compute_tis_weights(
+    *,
+    old_log_prob: torch.Tensor,
+    rollout_log_prob: torch.Tensor,
+    eos_mask: Optional[torch.Tensor],
+    level: str = "token",
+    mode: str = "truncate",
+    upper_threshold: Optional[float] = None,
+    lower_threshold: Optional[float] = None,
+    veto_threshold: float = 1e-4,
+    safety_bound: float = 20.0,
+) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
+    """
+    Compute the truncated importance sampling (TIS) weights and metrics.
+
+    Adapted from:
+
+    https://fengyao.notion.site/off-policy-rl#279721e3f6c48092bbe2fcfe0e9c6b33
+    https://yingru.notion.site/When-Speed-Kills-Stability-Demystifying-RL-Collapse-from-the-Training-Inference-Mismatch-271211a558b7808d8b12d403fd15edda
+
+    Args:
+        old_log_prob: The log probs from the policy model in the training backend. [batch_size, seq_len]
+        rollout_log_prob: The log probs from the policy model in the rollout backend. [batch_size, seq_len]
+        eos_mask: The mask of valid tokens. [batch_size, seq_len]
+        level: The aggregation level for the importance sampling weights.
+            - "token": per-token importance sampling weights, biased low variance.
+            - "sequence": product over tokens, unbiased but high variance.
+            - "geometric": geometric mean over tokens, biased, medium variance.
+        mode: how to handle the importance sampling weights exceeding the thresholds.
+            - "truncate": cap the importance sampling weights at the upper threshold, i.e., truncated importance sampling.
+            - "clip": zero the importance sampling weights outside the [lower, upper] range.
+        upper_threshold: The upper threshold for the importance sampling weights.
+        lower_threshold: The lower threshold for the importance sampling weights, only used in "clip" mode.
+            If not provided, it will be set to 1.0 / upper_threshold.
+        veto_threshold: If any token's importance sampling weight is less than this, zero the entire sequence weight.
+        safety_bound: The safety bound for the log-space ratio to avoid numerical overflow.
+
+    Returns:
+        weights: The importance sampling weights. [batch_size, seq_len]
+        metrics: The metrics for the importance sampling weights.
+    """
+    if upper_threshold is None:
+        return None, {}
+    if lower_threshold is None:
+        lower_threshold = 1.0 / upper_threshold
+
+    device = old_log_prob.device
+    log_ratio = old_log_prob - rollout_log_prob
+
+    log_upper_threshold = torch.log(torch.tensor(upper_threshold, device=device))
+    log_lower_threshold = torch.log(torch.tensor(lower_threshold, device=device))
+
+    if level == "token":
+        #  Token-level IS: π_training(a|s) / π_rollout(a|s) per token
+        # The truncation will be applied later.
+        log_ratio_for_metrics = log_ratio # [batch_size, seq_len]
+        log_ratio_safe = torch.clamp(log_ratio, min=-safety_bound, max=safety_bound)
+        weights = torch.exp(log_ratio_safe)
+    elif level == "sequence":
+        # Sequence-level IS: π_training(a|s) / π_rollout(a|s) across the entire sequence
+        log_ratio_sum = masked_sum(log_ratio, eos_mask, dim=-1).unsqueeze(-1)
+        log_ratio_for_metrics = log_ratio_sum # [batch_size, 1]
+        log_ratio_sum_safe = torch.clamp(log_ratio_sum, min=-safety_bound, max=safety_bound)
+        weights = torch.exp(log_ratio_sum_safe).expand_as(old_log_prob)
+    elif level == "geometric":
+        log_ratio_mean = masked_mean(log_ratio, eos_mask, dim=-1).unsqueeze(-1)
+        log_ratio_for_metrics = log_ratio_mean # [batch_size, 1]
+        log_ratio_mean_safe = torch.clamp(log_ratio_mean, min=-safety_bound, max=safety_bound)
+        weights = torch.exp(log_ratio_mean_safe).expand_as(old_log_prob)
+    else:
+        raise ValueError(f"Invalid importance sampling level: {level}")
+
+    log_veto_threshold = torch.log(torch.tensor(veto_threshold, device=device))
+    # Veto sequences with any token's log ratio below the threshold.
+    # log(π_training / π_rollout) < log(veto_threshold) ⟺ π_training / π_rollout < veto_threshold
+    catastrophic_tokens = (log_ratio < log_veto_threshold) & eos_mask.bool()
+    has_catastrophic = catastrophic_tokens.any(dim=-1, keepdim=True) # [batch_size, 1]
+    veto_mask = (~has_catastrophic).float() # [batch_size, 1]
+
+    metrics = compute_is_metrics(
+        is_weights=weights,
+        log_ratio_for_metrics=log_ratio_for_metrics,
+        eos_mask=eos_mask,
+        level=level,
+        upper_threshold=upper_threshold,
+        lower_threshold=lower_threshold,
+        log_upper_threshold=log_upper_threshold,
+        log_lower_threshold=log_lower_threshold,
+        has_catastrophic=has_catastrophic,
+        catastrophic_tokens=catastrophic_tokens,
+        safety_bound=safety_bound,
+    )
+
+    if mode == "truncate":
+        weights = weights.clamp(max=upper_threshold)
+    elif mode == "clip":
+        clip_mask = (weights >= lower_threshold) & (weights <= upper_threshold)
+        clip_mask_f = clip_mask.float()
+        metrics["tis_clipped_fraction"] = masked_mean(1 - clip_mask_f, eos_mask)
+        if level in ["sequence", "geometric"]:
+            seq_w = weights[:, 0] if weights.dim() > 1 else weights
+            seq_clipped = ((seq_w < lower_threshold) | (seq_w > upper_threshold)).float()
+            metrics["tis_seq_clipped_fraction"] = seq_clipped.mean()
+        else:
+            clipped_indicator = 1 - clip_mask_f
+            seq_has_clipped = masked_sum(clipped_indicator, eos_mask, dim=-1) > 0
+            metrics["tis_seq_clipped_fraction"] = seq_has_clipped.float().mean()
+        weights = weights * clip_mask_f
+    else:
+        raise ValueError(f"Invalid tis mode: {mode}")
+
+    weights = weights * veto_mask
+    weights = weights * eos_mask
+    weights = weights.detach()
+
+    metrics.update(
+        {
+            "tis_threshold_upper": upper_threshold,
+            "tis_threshold_lower": lower_threshold,
+            "tis_level": level,
+            "tis_mode": mode,
+            "tis_veto_threshold": veto_threshold,
+        }
+    )
+
+    return weights, metrics
+
+
+
 def compute_is_metrics(
     is_weights: torch.Tensor,
     log_ratio_for_metrics: torch.Tensor,
@@ -24,8 +153,8 @@ def compute_is_metrics(
     level: str,
     upper_threshold: float,
     lower_threshold: float,
-    log_threshold_upper: torch.Tensor,
-    log_threshold_lower: torch.Tensor,
+    log_upper_threshold: torch.Tensor,
+    log_lower_threshold: torch.Tensor,
     has_catastrophic: Optional[torch.Tensor],
     catastrophic_tokens: Optional[torch.Tensor],
     safety_bound: float,
@@ -48,8 +177,8 @@ def compute_is_metrics(
         metrics["tis_max"] = torch.exp(torch.clamp(log_max, max=safety_bound))
         metrics["tis_min"] = torch.exp(log_min)
         metrics["tis_mean"] = masked_mean(is_weights, eos_mask)
-        exceeds_upper = log_ratio_for_metrics > log_threshold_upper
-        below_lower = log_ratio_for_metrics < log_threshold_lower
+        exceeds_upper = log_ratio_for_metrics > log_upper_threshold
+        below_lower = log_ratio_for_metrics < log_lower_threshold
         if level == "sequence":
             metrics["tis_ratio_fraction_high"] = exceeds_upper.float().mean()
             metrics["tis_ratio_fraction_low"] = below_lower.float().mean()
@@ -155,100 +284,3 @@ def compute_kl_metrics(
 
     return metrics
 
-
-def compute_tis_weights(
-    *,
-    old_log_prob: torch.Tensor,
-    rollout_log_prob: torch.Tensor,
-    eos_mask: Optional[torch.Tensor],
-    level: str = "token",
-    mode: str = "truncate",
-    upper_threshold: Optional[float] = None,
-    lower_threshold: Optional[float] = None,
-    veto_threshold: float = 1e-4,
-    safety_bound: float = 20.0,
-) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
-    if upper_threshold is None:
-        return None, {}
-
-    device = old_log_prob.device
-    if eos_mask is None:
-        eos_mask = torch.ones_like(old_log_prob, dtype=torch.bool, device=device)
-
-    if lower_threshold is None:
-        lower_threshold = 1.0 / upper_threshold
-
-    log_ratio = old_log_prob - rollout_log_prob
-
-    log_threshold_upper = torch.log(torch.tensor(upper_threshold, device=device))
-    log_threshold_lower = torch.log(torch.tensor(lower_threshold, device=device))
-
-    if level == "token":
-        log_ratio_for_metrics = log_ratio
-        log_ratio_safe = torch.clamp(log_ratio, min=-safety_bound, max=safety_bound)
-        weights = torch.exp(log_ratio_safe)
-    elif level == "sequence":
-        log_ratio_sum = masked_sum(log_ratio, eos_mask, dim=-1).unsqueeze(-1)
-        log_ratio_for_metrics = log_ratio_sum
-        log_ratio_sum_safe = torch.clamp(log_ratio_sum, min=-safety_bound, max=safety_bound)
-        weights = torch.exp(log_ratio_sum_safe).expand_as(old_log_prob)
-    elif level == "geometric":
-        log_ratio_mean = masked_mean(log_ratio, eos_mask, dim=-1).unsqueeze(-1)
-        log_ratio_for_metrics = log_ratio_mean
-        log_ratio_mean_safe = torch.clamp(log_ratio_mean, min=-safety_bound, max=safety_bound)
-        weights = torch.exp(log_ratio_mean_safe).expand_as(old_log_prob)
-    else:
-        raise ValueError(f"Invalid tis level: {level}")
-
-    log_veto_threshold = torch.log(torch.tensor(veto_threshold, device=device))
-    catastrophic_tokens = (log_ratio < log_veto_threshold) & eos_mask.bool()
-    has_catastrophic = catastrophic_tokens.any(dim=-1, keepdim=True)
-    veto_mask = (~has_catastrophic).float()
-
-    metrics = compute_is_metrics(
-        is_weights=weights,
-        log_ratio_for_metrics=log_ratio_for_metrics,
-        eos_mask=eos_mask,
-        level=level,
-        upper_threshold=upper_threshold,
-        lower_threshold=lower_threshold,
-        log_threshold_upper=log_threshold_upper,
-        log_threshold_lower=log_threshold_lower,
-        has_catastrophic=has_catastrophic,
-        catastrophic_tokens=catastrophic_tokens,
-        safety_bound=safety_bound,
-    )
-
-    if mode == "truncate":
-        weights = weights.clamp(max=upper_threshold)
-    elif mode == "clip":
-        clip_mask = (weights >= lower_threshold) & (weights <= upper_threshold)
-        clip_mask_f = clip_mask.float()
-        metrics["tis_clipped_fraction"] = masked_mean(1 - clip_mask_f, eos_mask)
-        if level in ["sequence", "geometric"]:
-            seq_w = weights[:, 0] if weights.dim() > 1 else weights
-            seq_clipped = ((seq_w < lower_threshold) | (seq_w > upper_threshold)).float()
-            metrics["tis_seq_clipped_fraction"] = seq_clipped.mean()
-        else:
-            clipped_indicator = 1 - clip_mask_f
-            seq_has_clipped = masked_sum(clipped_indicator, eos_mask, dim=-1) > 0
-            metrics["tis_seq_clipped_fraction"] = seq_has_clipped.float().mean()
-        weights = weights * clip_mask_f
-    else:
-        raise ValueError(f"Invalid tis mode: {mode}")
-
-    weights = weights * veto_mask
-    weights = weights * eos_mask
-    weights = weights.detach()
-
-    metrics.update(
-        {
-            "tis_threshold_upper": upper_threshold,
-            "tis_threshold_lower": lower_threshold,
-            "tis_level": level,
-            "tis_mode": mode,
-            "tis_veto_threshold": veto_threshold,
-        }
-    )
-
-    return weights, metrics
