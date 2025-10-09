@@ -354,6 +354,7 @@ class FSDPTrainRayActor(TrainRayActor):
                     lower_threshold=lower,
                     veto_threshold=getattr(self.args, "tis_veto_threshold", 1e-4),
                     safety_bound=getattr(self.args, "tis_safety_bound", 20.0),
+                    response_lengths=response_lengths,
                 )
 
                 ois = (-ppo_kl).exp()

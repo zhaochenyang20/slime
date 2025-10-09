@@ -30,6 +30,24 @@ def masked_mean(x: torch.Tensor, mask: torch.Tensor, dim: int = -1) -> torch.Ten
     return masked_sum(x, mask, dim=dim) / valid_tokens
 
 
+def per_seq_masked_mean(
+    x: torch.Tensor,
+    mask: torch.Tensor,
+    response_lengths: Optional[list[int]] = None,
+) -> torch.Tensor:
+    """
+    计算按样本的 masked mean 后再求和，返回一个可加性的标量（适配 DP 汇总）。
+    支持二维 [B, T] 与拍平后一维、并提供 response_lengths 的两种输入形态。
+    """
+    if response_lengths is not None and len(response_lengths) > 0:
+        xs = torch.split(x, [int(l) for l in response_lengths], dim=0)
+        ms = torch.split(mask, [int(l) for l in response_lengths], dim=0)
+        seq_means = [masked_mean(xi, mi) for xi, mi in zip(xs, ms)]
+        return torch.stack(seq_means).sum()
+    # fallback:视为单一样本
+    return masked_mean(x, mask).unsqueeze(0).sum()
+
+
 def compute_tis_weights(
     *,
     old_log_prob: torch.Tensor,
@@ -41,6 +59,7 @@ def compute_tis_weights(
     lower_threshold: Optional[float] = None,
     veto_threshold: float = 1e-4,
     safety_bound: float = 20.0,
+    response_lengths: Optional[list[int]] = None,
 ) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
     """
     Compute the truncated importance sampling (TIS) weights and metrics.
@@ -51,9 +70,9 @@ def compute_tis_weights(
     https://yingru.notion.site/When-Speed-Kills-Stability-Demystifying-RL-Collapse-from-the-Training-Inference-Mismatch-271211a558b7808d8b12d403fd15edda
 
     Args:
-        old_log_prob: The log probs from the policy model in the training backend. [batch_size, seq_len]
-        rollout_log_prob: The log probs from the policy model in the rollout backend. [batch_size, seq_len]
-        eos_mask: The mask of valid tokens. [batch_size, seq_len]
+        old_log_prob: Flattened log probs from training backend. Shape: [sum(response_lengths)]
+        rollout_log_prob: Flattened log probs from rollout backend. Shape: [sum(response_lengths)]
+        eos_mask: Flattened mask aligned with flattened tensors. Shape: [sum(response_lengths)]
         level: The aggregation level for the importance sampling weights.
             - "token": per-token importance sampling weights, biased low variance.
             - "sequence": product over tokens, unbiased but high variance.
@@ -74,6 +93,7 @@ def compute_tis_weights(
     assert (
         eos_mask.shape == old_log_prob.shape and eos_mask.shape == rollout_log_prob.shape
     ), "eos_mask, old_log_prob, and rollout_log_prob must have the same shape"
+    assert response_lengths is not None and len(response_lengths) > 0, "response_lengths must be provided"
 
     if upper_threshold is None:
         return None, {}
@@ -89,20 +109,29 @@ def compute_tis_weights(
     if level == "token":
         #  Token-level IS: π_training(a|s) / π_rollout(a|s) per token
         # The truncation will be applied later.
-        log_ratio_for_metrics = log_ratio  # [batch_size, seq_len]
+        log_ratio_for_metrics = log_ratio  # [sum(response_lengths)]
         log_ratio_safe = torch.clamp(log_ratio, min=-safety_bound, max=safety_bound)
         weights = torch.exp(log_ratio_safe)
-    elif level == "sequence":
-        # Sequence-level IS: π_training(a|s) / π_rollout(a|s) across the entire sequence
-        log_ratio_sum = masked_sum(log_ratio, eos_mask, dim=-1).unsqueeze(-1)
-        log_ratio_for_metrics = log_ratio_sum  # [batch_size, 1]
-        log_ratio_sum_safe = torch.clamp(log_ratio_sum, min=-safety_bound, max=safety_bound)
-        weights = torch.exp(log_ratio_sum_safe).expand_as(old_log_prob)
-    elif level == "geometric":
-        log_ratio_mean = masked_mean(log_ratio, eos_mask, dim=-1).unsqueeze(-1)
-        log_ratio_for_metrics = log_ratio_mean  # [batch_size, 1]
-        log_ratio_mean_safe = torch.clamp(log_ratio_mean, min=-safety_bound, max=safety_bound)
-        weights = torch.exp(log_ratio_mean_safe).expand_as(old_log_prob)
+    elif level in ["sequence", "geometric"]:
+        # Sequence-level/geometric: compute per-sequence aggregate in log-space, then expand to tokens
+        xs = torch.split(log_ratio, [int(l) for l in response_lengths], dim=0)
+        ms = torch.split(eos_mask, [int(l) for l in response_lengths], dim=0)
+        per_seq_vals = []
+        for xi, mi in zip(xs, ms):
+            if level == "sequence":
+                val = (xi * mi).sum()
+            else:  # geometric
+                val = masked_mean(xi, mi)
+            per_seq_vals.append(torch.clamp(val, min=-safety_bound, max=safety_bound))
+        per_seq_vals = torch.stack(per_seq_vals)  # [num_sequences]
+        per_seq_weights = torch.exp(per_seq_vals)
+        # Expand to per-token weights per sequence
+        expanded = []
+        for w, xi in zip(per_seq_weights, xs):
+            expanded.append(torch.ones_like(xi) * w)
+        weights = torch.cat(expanded, dim=0)
+        # For metrics that need the aggregated log-ratio, keep per-seq values
+        log_ratio_for_metrics = per_seq_vals
     else:
         raise ValueError(f"Invalid importance sampling level: {level}")
 
@@ -110,8 +139,16 @@ def compute_tis_weights(
     # Veto sequences with any token's log ratio below the threshold.
     # log(π_training / π_rollout) < log(veto_threshold) ⟺ π_training / π_rollout < veto_threshold
     catastrophic_tokens = (log_ratio < log_veto_threshold) & eos_mask.bool()
-    has_catastrophic = catastrophic_tokens.any(dim=-1, keepdim=True)  # [batch_size, 1]
-    veto_mask = (~has_catastrophic).float()  # [batch_size, 1]
+    # Build per-sequence veto and expand to tokens
+    cat_chunks = torch.split(catastrophic_tokens, [int(l) for l in response_lengths], dim=0)
+    has_catastrophic_per_seq = torch.tensor([chunk.any() for chunk in cat_chunks], device=device)
+    veto_mask = torch.cat(
+        [
+            torch.zeros_like(chunk, dtype=torch.float32) if has_cat else torch.ones_like(chunk, dtype=torch.float32)
+            for has_cat, chunk in zip(has_catastrophic_per_seq, cat_chunks)
+        ],
+        dim=0,
+    )
 
     metrics = compute_tis_metrics(
         tis_weights=weights,
@@ -122,9 +159,10 @@ def compute_tis_weights(
         lower_threshold=lower_threshold,
         log_upper_threshold=log_upper_threshold,
         log_lower_threshold=log_lower_threshold,
-        has_catastrophic=has_catastrophic,
+        has_catastrophic=has_catastrophic_per_seq,
         catastrophic_tokens=catastrophic_tokens,
         safety_bound=safety_bound,
+        response_lengths=response_lengths,
     )
 
     if mode == "truncate":
@@ -172,6 +210,7 @@ def compute_tis_metrics(
     has_catastrophic: torch.Tensor,
     catastrophic_tokens: torch.Tensor,
     safety_bound: float,
+    response_lengths: Optional[list[int]] = None,
 ) -> Dict[str, Any]:
     """
     Computes metrics that reflect the TRUE distribution (before clamping)
@@ -181,63 +220,67 @@ def compute_tis_metrics(
 
     assert eos_mask.shape == tis_weights.shape, "eos_mask and tis_weights must have the same shape"
 
-    metrics["tis_veto_fraction"] = has_catastrophic.float().mean()
-    metrics["tis_catastrophic_token_fraction"] = masked_mean(catastrophic_tokens.float(), eos_mask)
+    # Counts/fractions reported as sum over sequences; external reducer divides by num_samples
+    metrics["tis_veto_fraction"] = has_catastrophic.float().sum()
+    metrics["tis_catastrophic_token_fraction"] = per_seq_masked_mean(
+        catastrophic_tokens.float(), eos_mask, response_lengths=response_lengths
+    )
     metrics["tis_level"] = level
-    metrics["tis_upper_threshold"] = upper_threshold
-    metrics["tis_lower_threshold"] = lower_threshold
-    metrics["tis_log_upper_threshold"] = log_upper_threshold
-    metrics["tis_log_lower_threshold"] = log_lower_threshold
-    metrics["tis_safety_bound"] = safety_bound
+    assert upper_threshold == 2.0
+    # Make numeric constants DP-safe by scaling with number of sequences in this batch
+    if tis_weights.dim() == 2:
+        num_sequences = tis_weights.size(0)
+    elif response_lengths is not None and len(response_lengths) > 0:
+        num_sequences = len(response_lengths)
+    else:
+        num_sequences = 1
+    metrics["tis_upper_threshold"] = torch.tensor(2.0 * num_sequences, device=tis_weights.device)
+    metrics["tis_lower_threshold"] = torch.tensor(lower_threshold * num_sequences, device=tis_weights.device)
+    metrics["tis_log_upper_threshold"] = log_upper_threshold * num_sequences
+    metrics["tis_log_lower_threshold"] = log_lower_threshold * num_sequences
+    metrics["tis_safety_bound"] = torch.tensor(safety_bound * num_sequences, device=tis_weights.device)
 
     if level in ["sequence", "geometric"]:
-        log_max = log_ratio_for_metrics.max()
-        log_min = log_ratio_for_metrics.min()
-        metrics["tis_max"] = torch.exp(torch.clamp(log_max, max=safety_bound))
-        metrics["tis_min"] = torch.exp(log_min)
-        metrics["tis_mean"] = masked_mean(tis_weights, eos_mask)
-        exceeds_upper = log_ratio_for_metrics > log_upper_threshold
-        below_lower = log_ratio_for_metrics < log_lower_threshold
-        if level == "sequence":
-            metrics["tis_ratio_fraction_exceeds_upper"] = exceeds_upper.float().mean()
-            metrics["tis_ratio_fraction_below_lower"] = below_lower.float().mean()
-        else:
-            exceeds_upper_exp = exceeds_upper.expand_as(eos_mask)
-            below_lower_exp = below_lower.expand_as(eos_mask)
-            metrics["tis_ratio_fraction_exceeds_upper"] = masked_mean(exceeds_upper_exp.float(), eos_mask)
-            metrics["tis_ratio_fraction_below_lower"] = masked_mean(below_lower_exp.float(), eos_mask)
+        # log_ratio_for_metrics is per-seq aggregated log-ratio: compare per-seq
+        exceeds_upper = (log_ratio_for_metrics > log_upper_threshold).float().sum()
+        below_lower = (log_ratio_for_metrics < log_lower_threshold).float().sum()
+        metrics["tis_ratio_fraction_exceeds_upper"] = exceeds_upper
+        metrics["tis_ratio_fraction_below_lower"] = below_lower
+        metrics["tis_mean"] = per_seq_masked_mean(tis_weights, eos_mask, response_lengths=response_lengths)
     else:
-        metrics["tis_mean"] = masked_mean(tis_weights, eos_mask)
-        exceeds_upper = tis_weights > upper_threshold
-        below_lower = tis_weights < lower_threshold
-        metrics["tis_ratio_fraction_exceeds_upper"] = masked_mean(exceeds_upper.float(), eos_mask)
-        metrics["tis_ratio_fraction_below_lower"] = masked_mean(below_lower.float(), eos_mask)
-        valid = eos_mask.bool()
-        metrics["tis_max"] = tis_weights[valid].max()
-        metrics["tis_min"] = tis_weights[valid].min()
+        metrics["tis_mean"] = per_seq_masked_mean(tis_weights, eos_mask, response_lengths=response_lengths)
+        exceeds_upper = (tis_weights > upper_threshold).float()
+        below_lower = (tis_weights < lower_threshold).float()
+        metrics["tis_ratio_fraction_exceeds_upper"] = per_seq_masked_mean(
+            exceeds_upper, eos_mask, response_lengths=response_lengths
+        )
+        metrics["tis_ratio_fraction_below_lower"] = per_seq_masked_mean(
+            below_lower, eos_mask, response_lengths=response_lengths
+        )
 
+    # Per-sequence std and ESS, reported as sum across sequences
     weights_for_std = tis_weights.clamp(min=lower_threshold, max=upper_threshold)
-    var = masked_mean(weights_for_std.square(), eos_mask) - metrics["tis_mean"].square()
-    metrics["tis_std"] = torch.sqrt(torch.clamp(var, min=0.0))
-    weights_for_ess = weights_for_std / (metrics["tis_mean"] + 1e-8)
-    metrics["tis_eff_sample_size"] = 1.0 / masked_mean(weights_for_ess.square(), eos_mask)
+    xs = torch.split(tis_weights, [int(l) for l in response_lengths], dim=0)
+    ms = torch.split(eos_mask, [int(l) for l in response_lengths], dim=0)
+    per_seq_mean = torch.stack([masked_mean(xi, mi) for xi, mi in zip(xs, ms)])
+    per_seq_var = (
+        torch.stack(
+            [masked_mean(xi.clamp(min=lower_threshold, max=upper_threshold).square(), mi) for xi, mi in zip(xs, ms)]
+        )
+        - per_seq_mean.square()
+    )
+    per_seq_std = torch.sqrt(torch.clamp(per_seq_var, min=0.0))
+    metrics["tis_std"] = per_seq_std.sum()
+    # ESS per sequence using normalized weights
+    weights_for_ess_list = [xi / (pm + 1e-8) for xi, pm in zip(xs, per_seq_mean)]
+    per_seq_ess = torch.stack([1.0 / masked_mean(xi.square(), mi) for xi, mi in zip(weights_for_ess_list, ms)])
+    metrics["tis_eff_sample_size"] = per_seq_ess.sum()
+    seq_mean = per_seq_mean
 
-    seq_mean = masked_mean(tis_weights, eos_mask, dim=-1)
-    metrics["tis_seq_mean"] = seq_mean.mean()
-    metrics["tis_seq_std"] = seq_mean.std()
-    metrics["tis_seq_max"] = seq_mean.max()
-    metrics["tis_seq_min"] = seq_mean.min()
-    seq_dev = (seq_mean - 1.0).abs()
-    metrics["tis_seq_max_deviation"] = seq_dev.max()
-    metrics["tis_seq_fraction_exceeds_upper"] = (seq_mean > upper_threshold).float().mean()
-    metrics["tis_seq_fraction_below_lower"] = (seq_mean < lower_threshold).float().mean()
-
-    flat = tis_weights[eos_mask.bool()]
-    metrics["tis_p25"] = torch.quantile(flat, 0.25)
-    metrics["tis_p50"] = torch.quantile(flat, 0.50)
-    metrics["tis_p75"] = torch.quantile(flat, 0.75)
-    metrics["tis_p95"] = torch.quantile(flat, 0.95)
-    metrics["tis_p99"] = torch.quantile(flat, 0.99)
+    # Sequence-level summaries (sum-style for DP-safe reduction)
+    metrics["tis_seq_mean"] = seq_mean.sum()
+    metrics["tis_seq_fraction_exceeds_upper"] = (seq_mean > upper_threshold).float().sum()
+    metrics["tis_seq_fraction_below_lower"] = (seq_mean < lower_threshold).float().sum()
 
     return metrics
 
@@ -255,37 +298,38 @@ def compute_kl_metrics(
     if eos_mask is None:
         eos_mask = torch.ones_like(old_log_prob, dtype=torch.bool, device=device)
 
-    # Direct estimator for KL(pi_rollout || pi_old): E[log pi_rollout - log pi_old]
-    metrics["rollout_kl"] = masked_mean(rollout_log_prob - old_log_prob, eos_mask)
+    # Direct estimator for KL(pi_rollout || pi_old): per-seq mean then sum (1D inputs only)
+    assert response_lengths is not None and eos_mask is not None
+    xs = torch.split(rollout_log_prob - old_log_prob, [int(l) for l in response_lengths], dim=0)
+    ms = torch.split(eos_mask, [int(l) for l in response_lengths], dim=0)
+    per_seq = [masked_mean(xi, mi) for xi, mi in zip(xs, ms)]
+    metrics["rollout_kl"] = torch.stack(per_seq).sum()
 
     # K3 estimator: E[exp(log(pi_old/pi_rollout)) - log(pi_old/pi_rollout) - 1]
     log_ratio = old_log_prob - rollout_log_prob
     k3_matrix = torch.exp(log_ratio) - log_ratio - 1
-    metrics["rollout_k3_kl"] = masked_mean(k3_matrix, eos_mask)
+    xs = torch.split(k3_matrix, [int(l) for l in response_lengths], dim=0)
+    ms = torch.split(eos_mask, [int(l) for l in response_lengths], dim=0)
+    per_seq = [masked_mean(xi, mi) for xi, mi in zip(xs, ms)]
+    metrics["rollout_k3_kl"] = torch.stack(per_seq).sum()
 
     # Sequence-level perplexity difference metrics
-    if old_log_prob.dim() == 2:
-        mean_log_prob_rollout_per_seq = masked_mean(rollout_log_prob, eos_mask, dim=-1)
-        mean_log_prob_old_per_seq = masked_mean(old_log_prob, eos_mask, dim=-1)
-    elif response_lengths is not None and len(response_lengths) > 0 and old_log_prob.dim() == 1:
-        seq_rollout_means = []
-        seq_old_means = []
-        start = 0
-        for length in response_lengths:
-            end = start + int(length)
-            mask_chunk = eos_mask[start:end] if eos_mask is not None else None
-            seq_rollout_means.append(masked_mean(rollout_log_prob[start:end], mask_chunk))
-            seq_old_means.append(masked_mean(old_log_prob[start:end], mask_chunk))
-            start = end
-        mean_log_prob_rollout_per_seq = torch.stack(seq_rollout_means)
-        mean_log_prob_old_per_seq = torch.stack(seq_old_means)
-    else:
-        # Fallback to global means if sequence boundaries are unavailable
-        mean_log_prob_rollout_per_seq = masked_mean(rollout_log_prob, eos_mask).unsqueeze(0)
-        mean_log_prob_old_per_seq = masked_mean(old_log_prob, eos_mask).unsqueeze(0)
+    assert response_lengths is not None and len(response_lengths) > 0
+    seq_rollout_means = []
+    seq_old_means = []
+    start = 0
+    for length in response_lengths:
+        end = start + int(length)
+        mask_chunk = eos_mask[start:end]
+        seq_rollout_means.append(masked_mean(rollout_log_prob[start:end], mask_chunk))
+        seq_old_means.append(masked_mean(old_log_prob[start:end], mask_chunk))
+        start = end
+    mean_log_prob_rollout_per_seq = torch.stack(seq_rollout_means)
+    mean_log_prob_old_per_seq = torch.stack(seq_old_means)
 
     diff = mean_log_prob_rollout_per_seq - mean_log_prob_old_per_seq
-    metrics["log_ppl_diff"] = diff.mean()
-    metrics["log_ppl_abs_diff"] = diff.abs().mean()
+    # report sums; external reducer divides by num_samples
+    metrics["log_ppl_diff"] = diff.sum()
+    metrics["log_ppl_abs_diff"] = diff.abs().sum()
 
     return metrics

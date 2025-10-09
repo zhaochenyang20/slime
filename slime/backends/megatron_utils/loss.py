@@ -16,7 +16,12 @@ from slime.utils.ppo_utils import (
 )
 from slime.utils.tis import compute_kl_metrics, compute_tis_weights
 
-from .cp_utils import all_gather_with_cp, get_logits_and_tokens_offset_with_cp, get_sum_of_sample_mean
+from .cp_utils import (
+    all_gather_with_cp,
+    get_logits_and_tokens_offset_with_cp,
+    get_sum_of_sample_mean,
+    slice_log_prob_with_cp,
+)
 
 
 def get_responses(
@@ -311,13 +316,33 @@ def policy_loss_function(args, batch, logits, sum_of_sample_mean):
         rollout_log_probs = torch.cat(batch["rollout_log_probs"], dim=0)
         old_log_probs = torch.cat(batch["log_probs"], dim=0)
 
-        # Build eos mask from loss masks (concatenated) to match flattened tensors
-        eos_mask = torch.cat(batch["loss_masks"], dim=0).to(device=log_probs.device)
+        # Build eos mask aligned with local (possibly CP-chunked) flattened tensors
+        cp_size = mpu.get_context_parallel_world_size()
+        if cp_size == 1:
+            eos_mask = torch.cat(batch["loss_masks"], dim=0).to(device=log_probs.device)
+        else:
+            # if CP enabled, use slice_log_prob_with_cp to slice loss_mask
+            mask_chunks = [
+                slice_log_prob_with_cp(loss_mask, total_len, resp_len)
+                for loss_mask, total_len, resp_len in zip(
+                    batch["loss_masks"], batch["total_lengths"], batch["response_lengths"]
+                )
+            ]
+            eos_mask = torch.cat(mask_chunks).to(device=log_probs.device)
+
+        # Ensure shape alignment with log-probs tensors for TIS
+        assert (
+            eos_mask.shape == old_log_probs.shape
+        ), f"eos_mask {eos_mask.shape} vs old_log_probs {old_log_probs.shape}"
+        assert (
+            eos_mask.shape == rollout_log_probs.shape
+        ), f"eos_mask {eos_mask.shape} vs rollout_log_probs {rollout_log_probs.shape}"
 
         # Use the new threshold parameters
         upper = args.tis_threshold_upper
         lower = args.tis_threshold_lower
 
+        assert upper == 2.0
         tis_weights, tis_metrics = compute_tis_weights(
             old_log_prob=old_log_probs,
             rollout_log_prob=rollout_log_probs,
@@ -328,6 +353,7 @@ def policy_loss_function(args, batch, logits, sum_of_sample_mean):
             lower_threshold=lower,
             veto_threshold=getattr(args, "tis_veto_threshold", 1e-4),
             safety_bound=getattr(args, "tis_safety_bound", 20.0),
+            response_lengths=batch["response_lengths"],
         )
 
         # On-policy ratio for monitoring (π_new/π_old)
