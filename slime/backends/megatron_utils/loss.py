@@ -309,6 +309,9 @@ def policy_loss_function(args, batch, logits, sum_of_sample_mean):
         assert "rollout_log_probs" in batch, "rollout_log_probs must be provided for TIS"
         rollout_log_probs = torch.cat(batch["rollout_log_probs"], dim=0)
         old_log_probs = torch.cat(batch["log_probs"], dim=0)
+        print("================================")
+        print(f"old_log_probs.shape: {old_log_probs.shape}, rollout_log_probs.shape: {rollout_log_probs.shape}")
+        print("================================")
 
         tis = torch.exp(old_log_probs - rollout_log_probs)
         ois = (-ppo_kl).exp()
