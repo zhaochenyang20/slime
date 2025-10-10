@@ -14,7 +14,7 @@ from slime.utils.ppo_utils import (
     get_reinforce_plus_plus_baseline_advantages,
     get_reinforce_plus_plus_returns,
 )
-from slime.utils.tis import assert_tis_input_format, compute_tis_weights
+from slime.utils.tis import compute_tis_weights
 
 from .cp_utils import (
     all_gather_with_cp,
@@ -324,24 +324,23 @@ def policy_loss_function(args, batch, logits, sum_of_sample_mean):
         ]
 
         # old_log_probs, log_probs, loss_masks are all concated into 1D tensor
-        full_old_log_probs = torch.cat(full_old_log_probs, dim=0)
-        full_log_probs = torch.cat(full_log_probs, dim=0)
+        full_old_log_probs_flat = torch.cat(full_old_log_probs, dim=0)
+        full_log_probs_flat = torch.cat(full_log_probs, dim=0)
         # loss_mask is not sliced by cp, so no need to all_gather
-        full_loss_masks = torch.cat(batch["loss_masks"], dim=0)
-
-        assert_tis_input_format(full_old_log_probs, full_log_probs, full_loss_masks)
+        full_loss_masks_flat = torch.cat(batch["loss_masks"], dim=0)
 
         tis_weights, tis_metrics = compute_tis_weights(
-            old_log_prob=full_old_log_probs,
-            rollout_log_prob=full_log_probs,
-            loss_mask=full_loss_masks,
+            old_log_prob_flat=full_old_log_probs_flat,
+            rollout_log_prob_flat=full_log_probs_flat,
+            loss_mask_flat=full_loss_masks_flat,
             level=getattr(args, "tis_level", "token"),
             mode=getattr(args, "tis_mode", "truncate"),
             upper_threshold=getattr(args, "tis_threshold_upper", 2.0),
             lower_threshold=getattr(args, "tis_threshold_lower", 1.0 / getattr(args, "tis_threshold_upper", 2.0)),
             veto_threshold=getattr(args, "tis_veto_threshold", 1e-4),
             safety_bound=getattr(args, "tis_safety_bound", 20.0),
-            response_lengths=total_lengths,
+            response_lengths=response_lengths,
+            total_lengths=total_lengths,
         )
 
         ois = (-ppo_kl).exp()

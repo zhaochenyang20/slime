@@ -1,80 +1,13 @@
-import re
 from typing import Any, Dict, Optional, Tuple
 
 import torch
 
 
-def assert_tis_input_format(
-    full_old_log_probs: torch.Tensor,
-    full_log_probs: torch.Tensor,
-    full_loss_masks: torch.Tensor,
-) -> None:
-    assert all(
-        tensor.dim() == 1 for tensor in [full_old_log_probs, full_log_probs, full_loss_masks]
-    ), f"{full_old_log_probs.dim()} vs {full_log_probs.dim()} vs {full_loss_masks.dim()}"
-
-    assert (
-        full_old_log_probs.shape == full_log_probs.shape and full_old_log_probs.shape == full_loss_masks.shape
-    ), f"{full_old_log_probs.shape} vs {full_log_probs.shape} vs {full_loss_masks.shape}"
-
-    loss_mask_str = "".join([str(int(x)) for x in full_loss_masks])
-    pattern = r"^1+(0+1+)*0*1*$"
-    assert re.fullmatch(pattern, loss_mask_str), "loss_mask format is not expected!"
-
-
-def masked_sum(x: torch.Tensor, mask: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    """
-    Computes the sum of the tensor x, masked by the mask.
-
-    x = [[1, 2, 3], [4, 5, 6]]
-    mask = [[1, 1, 1], [1, 1, 0]]
-    masked_sum(x, mask, dim=-1) = [6, 9]
-    """
-    valid_tokens = mask.sum(dim=dim)
-    assert valid_tokens.min() > 0, "any sequence must have at least one valid token"
-    assert x.shape == mask.shape, "x and mask must have the same shape"
-    return (x * mask).sum(dim=dim)
-
-
-def masked_mean(x: torch.Tensor, mask: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    """
-    Computes the mean of the tensor x, masked by the mask.
-
-    x = [[1, 2, 3], [4, 5, 6]]
-    mask = [[1, 1, 1], [1, 1, 0]]
-    masked_mean(x, mask, dim=-1) = [2, 4.5]
-    """
-    valid_tokens = mask.sum(dim=dim)
-    assert valid_tokens.min() > 0, "any sequence must have at least one valid token"
-    return masked_sum(x, mask, dim=dim) / valid_tokens
-
-
-def per_seq_masked_mean(
-    x: torch.Tensor,
-    mask: torch.Tensor,
-    response_lengths: Optional[list[int]] = None,
-) -> torch.Tensor:
-    """
-    计算按样本的 masked mean 后再求和，返回一个可加性的标量（适配 DP 汇总）。
-    支持二维 [B, T] 与拍平后一维、并提供 response_lengths 的两种输入形态。
-    """
-    if response_lengths is not None and len(response_lengths) > 0:
-        sequence_log_ratios = torch.split(x, [int(l) for l in response_lengths], dim=0)
-        sequence_loss_masks = torch.split(mask, [int(l) for l in response_lengths], dim=0)
-        seq_means = [
-            masked_mean(sequence_log_ratio, sequence_loss_mask)
-            for sequence_log_ratio, sequence_loss_mask in zip(sequence_log_ratios, sequence_loss_masks)
-        ]
-        return torch.stack(seq_means).sum()
-    # fallback:视为单一样本
-    return masked_mean(x, mask).unsqueeze(0).sum()
-
-
 def compute_tis_weights(
     *,
-    old_log_prob: torch.Tensor,
-    rollout_log_prob: torch.Tensor,
-    loss_mask: torch.Tensor,
+    old_log_prob_flat: torch.Tensor,
+    rollout_log_prob_flat: torch.Tensor,
+    loss_mask_flat: torch.Tensor,
     level: str = "token",
     mode: str = "truncate",
     upper_threshold: Optional[float] = None,
@@ -82,6 +15,7 @@ def compute_tis_weights(
     veto_threshold: float = 1e-4,
     safety_bound: float = 20.0,
     response_lengths: Optional[list[int]] = None,
+    total_lengths: Optional[list[int]] = None,
 ) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
     """
     Compute the truncated importance sampling (TIS) weights and metrics.
@@ -92,9 +26,11 @@ def compute_tis_weights(
     https://yingru.notion.site/When-Speed-Kills-Stability-Demystifying-RL-Collapse-from-the-Training-Inference-Mismatch-271211a558b7808d8b12d403fd15edda
 
     Args:
-        old_log_prob: Flattened log probs from training backend. Shape: [sum(response_lengths)]
-        rollout_log_prob: Flattened log probs from rollout backend. Shape: [sum(response_lengths)]
-        loss_mask: Flattened mask aligned with flattened tensors. Shape: [sum(response_lengths)]
+        old_log_prob_flat: Flattened log probs from training backend. Shape: [sum(response_lengths)]
+        rollout_log_prob_flat: Flattened log probs from rollout backend. Shape: [sum(response_lengths)]
+        loss_mask_flat: Flattened mask aligned with flattened tensors. Shape: [sum(response_lengths)]
+            Note that for single turn RL, the loss_mask_flat is [1] * sum(response_lengths)
+            For multi turn RL, the tool response will be marked as 0 in the loss_mask_flat.
         level: The aggregation level for the importance sampling weights.
             - "token": per-token importance sampling weights, biased low variance.
             - "sequence": product over tokens, unbiased but high variance.
@@ -107,29 +43,37 @@ def compute_tis_weights(
             If not provided, it will be set to 1.0 / upper_threshold.
         veto_threshold: If any token's importance sampling weight is less than this, zero the entire sequence weight.
         safety_bound: The safety bound for the log-space ratio to avoid numerical overflow.
+        response_lengths: The length of the response for each sequence.
+        total_lengths: The total length of the whole sequence for each sequence.
 
     Returns:
         weights: The importance sampling weights. [batch_size, seq_len]
         metrics: The metrics for the importance sampling weights.
     """
+
+    assert all(
+        tensor.dim() == 1 for tensor in [old_log_prob_flat, rollout_log_prob_flat, loss_mask_flat]
+    ), f"{old_log_prob_flat.dim()} vs {rollout_log_prob_flat.dim()} vs {loss_mask_flat.dim()}"
+
     assert (
-        loss_mask.shape == old_log_prob.shape and loss_mask.shape == rollout_log_prob.shape
-    ), "loss_mask, old_log_prob, and rollout_log_prob must have the same shape"
-    assert response_lengths is not None and len(response_lengths) > 0, "response_lengths must be provided"
+        old_log_prob_flat.shape == rollout_log_prob_flat.shape and old_log_prob_flat.shape == loss_mask_flat.shape
+    ), f"{old_log_prob_flat.shape} vs {rollout_log_prob_flat.shape} vs {loss_mask_flat.shape}"
 
     if upper_threshold is None:
         return None, {}
     if lower_threshold is None:
         lower_threshold = 1.0 / upper_threshold
 
-    device = old_log_prob.device
-    log_ratio = old_log_prob - rollout_log_prob
+    device = old_log_prob_flat.device
+    log_ratio = old_log_prob_flat - rollout_log_prob_flat
 
     log_upper_threshold = torch.log(torch.tensor(upper_threshold, device=device))
     log_lower_threshold = torch.log(torch.tensor(lower_threshold, device=device))
 
+    # compute TIS weights without truncation/clipping
+
     if level == "token":
-        #  Token-level IS: π_training(a|s) / π_rollout(a|s) per token
+        # Token-level IS: π_training(a|s) / π_rollout(a|s) per token
         # The truncation will be applied later.
         log_ratio_for_metrics = log_ratio  # [sum(response_lengths)]
         log_ratio_safe = torch.clamp(log_ratio, min=-safety_bound, max=safety_bound)
@@ -137,13 +81,13 @@ def compute_tis_weights(
     elif level in ["sequence", "geometric"]:
         # Sequence-level/geometric: compute per-sequence aggregate in log-space, then expand to tokens
         sequence_log_ratios = torch.split(log_ratio, [int(l) for l in response_lengths], dim=0)
-        sequence_loss_masks = torch.split(loss_mask, [int(l) for l in response_lengths], dim=0)
+        sequence_loss_masks = torch.split(loss_mask_flat, [int(l) for l in response_lengths], dim=0)
         per_seq_vals = []
         for sequence_log_ratio, sequence_loss_mask in zip(sequence_log_ratios, sequence_loss_masks):
             if level == "sequence":
                 val = (sequence_log_ratio * sequence_loss_mask).sum()
             else:  # geometric
-                val = masked_mean(sequence_log_ratio, sequence_loss_mask)
+                val = (sequence_log_ratio * sequence_loss_mask).sum() / sequence_loss_mask.sum()
             per_seq_vals.append(torch.clamp(val, min=-safety_bound, max=safety_bound))
         per_seq_vals = torch.stack(per_seq_vals)  # [num_sequences]
         per_seq_weights = torch.exp(per_seq_vals)
@@ -157,10 +101,12 @@ def compute_tis_weights(
     else:
         raise ValueError(f"Invalid importance sampling level: {level}")
 
+    # TODO：继续 filter out catastrophic tokens
+
     log_veto_threshold = torch.log(torch.tensor(veto_threshold, device=device))
     # Veto sequences with any token's log ratio below the threshold.
     # log(π_training / π_rollout) < log(veto_threshold) ⟺ π_training / π_rollout < veto_threshold
-    catastrophic_tokens = (log_ratio < log_veto_threshold) & loss_mask.bool()
+    catastrophic_tokens = (log_ratio < log_veto_threshold) & loss_mask_flat.bool()
     # Build per-sequence veto and expand to tokens
     cat_chunks = torch.split(catastrophic_tokens, [int(l) for l in response_lengths], dim=0)
     has_catastrophic_per_seq = torch.tensor([chunk.any() for chunk in cat_chunks], device=device)
