@@ -339,7 +339,7 @@ class FSDPTrainRayActor(TrainRayActor):
                 )
 
                 # Build eos mask from loss masks
-                eos_mask = torch.cat(loss_masks, dim=0).to(device=log_probs.device)
+                loss_mask = torch.cat(loss_masks, dim=0).to(device=log_probs.device)
 
                 upper = self.args.tis_threshold_upper
                 lower = self.args.tis_threshold_lower
@@ -347,7 +347,7 @@ class FSDPTrainRayActor(TrainRayActor):
                 tis_weights, tis_metrics = compute_tis_weights(
                     old_log_prob=old_log_probs,
                     rollout_log_prob=rollout_log_probs,
-                    eos_mask=eos_mask,
+                    loss_mask=loss_mask,
                     level=getattr(self.args, "tis_level", "token"),
                     mode=getattr(self.args, "tis_mode", "truncate"),
                     upper_threshold=upper,
@@ -366,7 +366,7 @@ class FSDPTrainRayActor(TrainRayActor):
                 kl_metrics = compute_kl_metrics(
                     old_log_prob=old_log_probs,
                     rollout_log_prob=rollout_log_probs,
-                    eos_mask=eos_mask,
+                    loss_mask=loss_mask,
                     response_lengths=response_lengths,
                 )
 
