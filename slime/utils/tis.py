@@ -1,6 +1,25 @@
+import re
 from typing import Any, Dict, Optional, Tuple
 
 import torch
+
+
+def assert_tis_input_format(
+    full_old_log_probs: torch.Tensor,
+    full_log_probs: torch.Tensor,
+    full_loss_masks: torch.Tensor,
+) -> None:
+    assert all(
+        tensor.dim() == 1 for tensor in [full_old_log_probs, full_log_probs, full_loss_masks]
+    ), f"{full_old_log_probs.dim()} vs {full_log_probs.dim()} vs {full_loss_masks.dim()}"
+
+    assert (
+        full_old_log_probs.shape == full_log_probs.shape and full_old_log_probs.shape == full_loss_masks.shape
+    ), f"{full_old_log_probs.shape} vs {full_log_probs.shape} vs {full_loss_masks.shape}"
+
+    loss_mask_str = "".join([str(int(x)) for x in full_loss_masks])
+    pattern = r"^1+(0+1+)*0*1*$"
+    assert re.fullmatch(pattern, loss_mask_str), "loss_mask format is not expected!"
 
 
 def masked_sum(x: torch.Tensor, mask: torch.Tensor, dim: int = -1) -> torch.Tensor:

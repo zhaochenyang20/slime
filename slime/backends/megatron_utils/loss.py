@@ -1,4 +1,3 @@
-import re
 from typing import Union
 
 import torch
@@ -15,7 +14,7 @@ from slime.utils.ppo_utils import (
     get_reinforce_plus_plus_baseline_advantages,
     get_reinforce_plus_plus_returns,
 )
-from slime.utils.tis import compute_kl_metrics, compute_tis_weights
+from slime.utils.tis import assert_tis_input_format, compute_tis_weights
 
 from .cp_utils import (
     all_gather_with_cp,
@@ -314,78 +313,52 @@ def policy_loss_function(args, batch, logits, sum_of_sample_mean):
     # Apply TIS off-policy correction using importance sampling if enabled
     if args.use_tis:
         assert "rollout_log_probs" in batch, "rollout_log_probs must be provided for TIS"
-        cp_size = mpu.get_context_parallel_world_size()
-        upper = args.tis_threshold_upper
-        lower = args.tis_threshold_lower
-        assert upper == 2.0
 
-        total_lengths = batch["total_lengths"]
-        response_lengths = batch["response_lengths"]
+        full_log_probs = [
+            all_gather_with_cp(log_prob, total_length, response_length)
+            for log_prob, total_length, response_length in zip(log_probs, total_lengths, response_lengths)
+        ]
+        full_old_log_probs = [
+            all_gather_with_cp(old_log_prob, total_length, response_length)
+            for old_log_prob, total_length, response_length in zip(old_log_probs, total_lengths, response_lengths)
+        ]
 
-        # 1) 组装全序列 old/rollout/mask（CP=1 直接拼接；CP>1 用 all_gather 重建）
-        if cp_size == 1:
-            full_old_list = batch["log_probs"]
-            full_rollout_list = batch["rollout_log_probs"]
-            full_mask_list = batch["loss_masks"]
-        else:
-            full_old_list = [
-                all_gather_with_cp(lp, total_len, resp_len)
-                for lp, total_len, resp_len in zip(batch["log_probs"], total_lengths, response_lengths)
-            ]
-            full_rollout_list = [
-                all_gather_with_cp(lp, total_len, resp_len)
-                for lp, total_len, resp_len in zip(batch["rollout_log_probs"], total_lengths, response_lengths)
-            ]
-            # loss_masks 已是每样本全序列
-            full_mask_list = batch["loss_masks"]
+        # old_log_probs, log_probs, loss_masks are all concated into 1D tensor
+        full_old_log_probs = torch.cat(full_old_log_probs, dim=0)
+        full_log_probs = torch.cat(full_log_probs, dim=0)
+        # loss_mask is not sliced by cp, so no need to all_gather
+        full_loss_masks = torch.cat(batch["loss_masks"], dim=0)
 
-        old_full_flat = torch.cat(full_old_list, dim=0)
-        rollout_full_flat = torch.cat(full_rollout_list, dim=0)
-        mask_full_flat = torch.cat(full_mask_list, dim=0).to(device=log_probs.device)
+        assert_tis_input_format(full_old_log_probs, full_log_probs, full_loss_masks)
 
-        # 2) 基本一致性与格式校验
-        assert old_full_flat.shape == rollout_full_flat.shape == mask_full_flat.shape
-        loss_mask_str = "".join([str(int(x)) for x in mask_full_flat])
-        pattern = r"^1+(0+1+)*0*1*$"
-        assert re.fullmatch(pattern, loss_mask_str), "loss_mask format is not expected!"
-
-        # 3) 全序列上计算 TIS 权重和指标
-        tis_weights_full_flat, tis_metrics = compute_tis_weights(
-            old_log_prob=old_full_flat,
-            rollout_log_prob=rollout_full_flat,
-            loss_mask=mask_full_flat,
+        tis_weights, tis_metrics = compute_tis_weights(
+            old_log_prob=full_old_log_probs,
+            rollout_log_prob=full_log_probs,
+            loss_mask=full_loss_masks,
             level=getattr(args, "tis_level", "token"),
             mode=getattr(args, "tis_mode", "truncate"),
-            upper_threshold=upper,
-            lower_threshold=lower,
+            upper_threshold=getattr(args, "tis_threshold_upper", 2.0),
+            lower_threshold=getattr(args, "tis_threshold_lower", 1.0 / getattr(args, "tis_threshold_upper", 2.0)),
             veto_threshold=getattr(args, "tis_veto_threshold", 1e-4),
             safety_bound=getattr(args, "tis_safety_bound", 20.0),
-            response_lengths=response_lengths,
+            response_lengths=total_lengths,
         )
 
-        # On-policy ratio for monitoring (π_new/π_old)
         ois = (-ppo_kl).exp()
 
-        # 4) 应用权重（CP>1 时回切至本地切片）
-        if tis_weights_full_flat is not None:
-            if cp_size == 1:
-                pg_loss = pg_loss * tis_weights_full_flat
-            else:
-                per_seq_weights = list(torch.split(tis_weights_full_flat, [int(l) for l in response_lengths], dim=0))
-                local_weight_chunks = [
-                    slice_log_prob_with_cp(w, total_len, resp_len)
-                    for w, total_len, resp_len in zip(per_seq_weights, total_lengths, response_lengths)
-                ]
-                tis_weights_local_flat = torch.cat(local_weight_chunks, dim=0)
-                pg_loss = pg_loss * tis_weights_local_flat
+        # tis_weights is a 1D tensor, should be sliced to the local cp rank
+        local_tis_chunks = []
+        start = 0
+        for total_len, response_len in zip(total_lengths, response_lengths):
+            end = start + int(response_len)
+            seq_weights = tis_weights[start:end]
+            # Slice to the two local chunks of this CP rank
+            local_chunk = slice_log_prob_with_cp(seq_weights, int(total_len), int(response_len))
+            local_tis_chunks.append(local_chunk)
+            start = end
+        tis_weights = torch.cat(local_tis_chunks, dim=0)
 
-        # 5) KL 指标统一基于全序列
-        kl_metrics = compute_kl_metrics(
-            old_log_prob=old_full_flat,
-            rollout_log_prob=rollout_full_flat,
-            loss_mask=mask_full_flat,
-            response_lengths=response_lengths,
-        )
+        pg_loss = pg_loss * tis_weights
 
     pg_loss = sum_of_sample_mean(pg_loss)
     pg_clipfrac = sum_of_sample_mean(pg_clipfrac)
