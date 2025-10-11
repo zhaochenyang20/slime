@@ -3,6 +3,41 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 
 
+def masked_sum(
+    tensor: torch.Tensor, mask: torch.Tensor, dim: Optional[int] = None, keepdim: bool = False
+) -> torch.Tensor:
+    mask_f = mask if mask.dtype.is_floating_point else mask.float()
+    return (tensor * mask_f).sum(dim=dim, keepdim=keepdim)
+
+
+def masked_mean(
+    tensor: torch.Tensor,
+    mask: torch.Tensor,
+    dim: Optional[int] = None,
+    keepdim: bool = False,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    mask_f = mask if mask.dtype.is_floating_point else mask.float()
+    total = (tensor * mask_f).sum(dim=dim, keepdim=keepdim)
+    denom = mask_f.sum(dim=dim, keepdim=keepdim)
+    return total / (denom + eps)
+
+
+def per_seq_masked_mean(
+    tensor: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    response_lengths: Optional[list[int]] = None,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    assert response_lengths is not None and len(response_lengths) > 0
+    lengths = [int(l) for l in response_lengths]
+    chunks = torch.split(tensor, lengths, dim=0)
+    mask_chunks = torch.split(mask, lengths, dim=0)
+    per_seq = [masked_mean(t, m, eps=eps) for t, m in zip(chunks, mask_chunks)]
+    return torch.stack(per_seq).sum()
+
+
 def compute_tis_weights(
     *,
     old_log_prob_flat: torch.Tensor,
@@ -69,59 +104,106 @@ def compute_tis_weights(
 
     log_upper_threshold = torch.log(torch.tensor(upper_threshold, device=device))
     log_lower_threshold = torch.log(torch.tensor(lower_threshold, device=device))
+    log_veto_threshold = torch.log(torch.tensor(veto_threshold, device=device))
 
-    # compute TIS weights without truncation/clipping
+    # compute TIS raw weights and catastrophe flags in a single big if/else
 
     if level == "token":
-        # Token-level IS: π_training(a|s) / π_rollout(a|s) per token
-        # The truncation will be applied later.
+        # Token-level IS: π_training(a|s) / π_rollout(a|s) per token (raw, before veto and truncate/clip)
         log_ratio_for_metrics = log_ratio  # [sum(response_lengths)]
         log_ratio_safe = torch.clamp(log_ratio, min=-safety_bound, max=safety_bound)
         weights = torch.exp(log_ratio_safe)
+
+        # Catastrophe detection and veto mask per sequence
+
+        catastrophic_tokens = (log_ratio < log_veto_threshold) & loss_mask_flat.bool()
+        cat_chunks = torch.split(catastrophic_tokens, [int(l) for l in response_lengths], dim=0)
+        has_catastrophic_per_seq = torch.tensor([chunk.any() for chunk in cat_chunks], device=device)
+        veto_mask = torch.cat(
+            [
+                (
+                    torch.zeros_like(chunk, dtype=torch.float32)
+                    if has_cat
+                    else torch.ones_like(chunk, dtype=torch.float32)
+                )
+                for has_cat, chunk in zip(has_catastrophic_per_seq, cat_chunks)
+            ],
+            dim=0,
+        )
     elif level in ["sequence", "geometric"]:
-        # Sequence-level/geometric: compute per-sequence aggregate in log-space, then expand to tokens
-        sequence_log_ratios = torch.split(log_ratio, [int(l) for l in response_lengths], dim=0)
-        sequence_loss_masks = torch.split(loss_mask_flat, [int(l) for l in response_lengths], dim=0)
-        per_seq_vals = []
-        for sequence_log_ratio, sequence_loss_mask in zip(sequence_log_ratios, sequence_loss_masks):
+        # Sequence-level/geometric: single split, aggregate, then expand (raw, before veto and truncate/clip)
+        assert response_lengths is not None and len(response_lengths) > 0
+        seq_lengths = [int(l) for l in response_lengths]
+
+        seq_log_ratio_chunks = torch.split(log_ratio, seq_lengths, dim=0)
+        seq_loss_mask_chunks = torch.split(loss_mask_flat, seq_lengths, dim=0)
+
+        per_seq_vals_list = []
+        catastrophic_token_chunks = []
+
+        for log_ratio_chunk, loss_mask_chunk in zip(seq_log_ratio_chunks, seq_loss_mask_chunks):
             if level == "sequence":
-                val = (sequence_log_ratio * sequence_loss_mask).sum()
+                aggregated = (log_ratio_chunk * loss_mask_chunk).sum()  # [1]
             else:  # geometric
-                val = (sequence_log_ratio * sequence_loss_mask).sum() / sequence_loss_mask.sum()
-            per_seq_vals.append(torch.clamp(val, min=-safety_bound, max=safety_bound))
-        per_seq_vals = torch.stack(per_seq_vals)  # [num_sequences]
-        per_seq_weights = torch.exp(per_seq_vals)
-        # Expand to per-token weights per sequence
-        expanded = []
-        for w, sequence_log_ratio in zip(per_seq_weights, sequence_log_ratios):
-            expanded.append(torch.ones_like(sequence_log_ratio) * w)
-        weights = torch.cat(expanded, dim=0)
-        # For metrics that need the aggregated log-ratio, keep per-seq values
-        log_ratio_for_metrics = per_seq_vals
+                aggregated = (log_ratio_chunk * loss_mask_chunk).sum() / loss_mask_chunk.sum()
+            per_seq_vals_list.append(torch.clamp(aggregated, min=-safety_bound, max=safety_bound))
+
+            # Catastrophic tokens per sequence
+            cat_tokens_chunk = (log_ratio_chunk < log_veto_threshold) & loss_mask_chunk.bool()  # [response_lengths]
+            catastrophic_token_chunks.append(cat_tokens_chunk)
+
+        # each sequence only has one value in per_seq_vals_list
+        per_seq_vals = torch.stack(per_seq_vals_list)  # [num_sequences]
+        # Expand per_seq_vals to match token-level shape for consistent metrics calculation
+        log_ratio_for_metrics = torch.cat(
+            [
+                torch.ones_like(log_ratio_chunk) * per_seq_val
+                for per_seq_val, log_ratio_chunk in zip(per_seq_vals, seq_log_ratio_chunks)
+            ],
+            dim=0,
+        )  # [sum(response_lengths)]
+        weights = torch.exp(log_ratio_for_metrics)
+
+        # Compose catastrophe tensors
+        catastrophic_tokens = torch.cat(catastrophic_token_chunks, dim=0)  # [sum(response_lengths)]
+        has_catastrophic_per_seq = torch.tensor(
+            [chunk.any() for chunk in catastrophic_token_chunks], device=device
+        )  # [num_sequences]
+
+        # Build veto mask per token from per-seq flags
+        veto_mask = torch.cat(
+            [
+                (
+                    torch.zeros_like(chunk, dtype=torch.float32)
+                    if has_cat
+                    else torch.ones_like(chunk, dtype=torch.float32)
+                )
+                for has_cat, chunk in zip(has_catastrophic_per_seq, seq_log_ratio_chunks)
+            ],
+            dim=0,
+        )
     else:
         raise ValueError(f"Invalid importance sampling level: {level}")
 
-    # TODO：继续 filter out catastrophic tokens
+    # Apply veto before mode as requested
+    weights = weights * veto_mask
+    # Then apply mode (truncate/clip) in a unified way
+    if mode == "truncate":
+        weights = weights.clamp(max=upper_threshold)
+    elif mode == "clip":
+        clip_mask = (weights >= lower_threshold) & (weights <= upper_threshold)
+        clip_mask = clip_mask.float()
+        weights = weights * clip_mask
+    else:
+        raise ValueError(f"Invalid tis mode: {mode}")
 
-    log_veto_threshold = torch.log(torch.tensor(veto_threshold, device=device))
-    # Veto sequences with any token's log ratio below the threshold.
-    # log(π_training / π_rollout) < log(veto_threshold) ⟺ π_training / π_rollout < veto_threshold
-    catastrophic_tokens = (log_ratio < log_veto_threshold) & loss_mask_flat.bool()
-    # Build per-sequence veto and expand to tokens
-    cat_chunks = torch.split(catastrophic_tokens, [int(l) for l in response_lengths], dim=0)
-    has_catastrophic_per_seq = torch.tensor([chunk.any() for chunk in cat_chunks], device=device)
-    veto_mask = torch.cat(
-        [
-            torch.zeros_like(chunk, dtype=torch.float32) if has_cat else torch.ones_like(chunk, dtype=torch.float32)
-            for has_cat, chunk in zip(has_catastrophic_per_seq, cat_chunks)
-        ],
-        dim=0,
-    )
+    weights = weights * loss_mask_flat
+    weights = weights.detach()
 
     metrics = compute_tis_metrics(
         tis_weights=weights,
         log_ratio_for_metrics=log_ratio_for_metrics,
-        loss_mask=loss_mask,
+        loss_mask=loss_mask_flat,
         level=level,
         upper_threshold=upper_threshold,
         lower_threshold=lower_threshold,
@@ -133,35 +215,6 @@ def compute_tis_weights(
         response_lengths=response_lengths,
     )
 
-    if mode == "truncate":
-        # only truncate the weights at the upper threshold
-        weights = weights.clamp(max=upper_threshold)
-    elif mode == "clip":
-        # zero the weights outside the [lower, upper] range
-        if level in ["sequence", "geometric"]:
-            seq_weights = weights[:, 0] if weights.dim() > 1 else weights
-            sequence_clipped = ((seq_weights < lower_threshold) | (seq_weights > upper_threshold)).float()
-            metrics["tis_sequence_clipped_fraction"] = sequence_clipped.mean()
-        else:
-            clip_mask = (weights >= lower_threshold) & (weights <= upper_threshold)
-            clip_mask = clip_mask.float()
-            clipped_indicator = 1 - clip_mask
-            metrics["tis_token_clipped_fraction"] = masked_mean(clipped_indicator, loss_mask)
-            sequence_has_clipped = masked_sum(clipped_indicator, loss_mask, dim=-1) > 0
-            metrics["tis_sequence_clipped_fraction"] = sequence_has_clipped.float().mean()
-        weights = weights * clip_mask
-    else:
-        raise ValueError(f"Invalid tis mode: {mode}")
-
-    weights = weights * veto_mask
-    weights = weights * loss_mask
-    weights = weights.detach()
-
-    metrics["tis_threshold_upper"] = upper_threshold
-    metrics["tis_threshold_lower"] = lower_threshold
-    metrics["tis_level"] = level
-    metrics["tis_mode"] = mode
-    metrics["tis_veto_threshold"] = veto_threshold
     return weights, metrics
 
 
