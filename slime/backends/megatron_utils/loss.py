@@ -403,13 +403,7 @@ def policy_loss_function(args, batch, logits, sum_of_sample_mean):
     if args.use_tis:
         # Backward compatible basic logs
         reported_loss["ois"] = sum_of_sample_mean(ois).clone().detach()
-        # Report all TIS and KL metrics uniformly, filtering out non-numeric values
-        for k, v in {**tis_metrics, **kl_metrics}.items():
-            if torch.is_tensor(v):
-                reported_loss[k] = v.clone().detach()
-            elif isinstance(v, (int, float)):
-                reported_loss[k] = torch.tensor(v, device=logits.device)
-            # Skip string and other non-numeric types
+
 
     return loss, reported_loss
 
