@@ -314,9 +314,12 @@ def policy_loss_function(args, batch, logits, sum_of_sample_mean):
     if args.use_tis:
         assert "rollout_log_probs" in batch, "rollout_log_probs must be provided for TIS"
 
-        full_log_probs = [
+        rollout_log_probs = batch["rollout_log_probs"]
+        old_log_probs = batch["log_probs"]
+
+        full_rollout_log_probs = [
             all_gather_with_cp(log_prob, total_length, response_length)
-            for log_prob, total_length, response_length in zip(log_probs, total_lengths, response_lengths)
+            for log_prob, total_length, response_length in zip(rollout_log_probs, total_lengths, response_lengths)
         ]
         full_old_log_probs = [
             all_gather_with_cp(old_log_prob, total_length, response_length)
@@ -325,13 +328,13 @@ def policy_loss_function(args, batch, logits, sum_of_sample_mean):
 
         # old_log_probs, log_probs, loss_masks are all concated into 1D tensor
         full_old_log_probs_flat = torch.cat(full_old_log_probs, dim=0)
-        full_log_probs_flat = torch.cat(full_log_probs, dim=0)
+        full_rollout_log_probs = torch.cat(full_rollout_log_probs, dim=0)
         # loss_mask is not sliced by cp, so no need to all_gather
         full_loss_masks_flat = torch.cat(batch["loss_masks"], dim=0)
 
         tis_weights, tis_metrics = compute_tis_weights(
             old_log_prob_flat=full_old_log_probs_flat,
-            rollout_log_prob_flat=full_log_probs_flat,
+            rollout_log_prob_flat=full_rollout_log_probs,
             loss_mask_flat=full_loss_masks_flat,
             level=getattr(args, "tis_level", "token"),
             mode=getattr(args, "tis_mode", "truncate"),
