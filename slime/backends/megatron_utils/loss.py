@@ -404,7 +404,6 @@ def policy_loss_function(args, batch, logits, sum_of_sample_mean):
         # Backward compatible basic logs
         reported_loss["ois"] = sum_of_sample_mean(ois).clone().detach()
 
-
     return loss, reported_loss
 
 
