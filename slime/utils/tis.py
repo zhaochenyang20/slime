@@ -21,6 +21,12 @@ def masked_mean(
     return total / (denom + eps)
 
 
+def metrics_add(metrics: Dict[str, Any], key: str, value: float) -> None:
+    if key not in metrics:
+        metrics[key] = 0
+    metrics[key] += value
+
+
 def calculate_veto_mask(
     log_ratio_for_metrics: torch.Tensor,
     loss_mask: torch.Tensor,
@@ -39,31 +45,31 @@ def calculate_veto_mask(
     veto_mask = (~has_catastrophic).float().expand_as(log_ratio_for_metrics)
 
     # Update metrics
-    metrics["catastrophic_ratio"] += masked_mean(has_catastrophic.int(), loss_mask)
+    metrics_add(metrics, "catastrophic_ratio", masked_mean(has_catastrophic.int(), loss_mask))
     return veto_mask
 
 
 def truncate(weights: torch.Tensor, loss_mask: torch.Tensor, metrics: Dict[str, Any], *, eps: float) -> torch.Tensor:
-    metrics["mean"] += masked_mean(weights, loss_mask)
-    metrics["truncate_fraction"] += masked_mean((weights > eps).int(), loss_mask)
+    metrics_add(metrics, "mean", masked_mean(weights, loss_mask))
+    metrics_add(metrics, "truncate_fraction", masked_mean((weights > eps).int(), loss_mask))
     return weights.clamp(0, eps) * loss_mask
 
 
 def clip(
     weights: torch.Tensor, loss_mask: torch.Tensor, metrics: Dict[str, Any], *, eps_clip: float, eps_clip_high: float
 ) -> torch.Tensor:
-    metrics["mean"] += masked_mean(weights, loss_mask)
-    metrics["clip_fraction_low"] += masked_mean((weights < 1 - eps_clip).int(), loss_mask)
-    metrics["clip_fraction_high"] += masked_mean((weights > 1 + eps_clip_high).int(), loss_mask)
+    metrics_add(metrics, "mean", masked_mean(weights, loss_mask))
+    metrics_add(metrics, "clip_fraction_low", masked_mean((weights < 1 - eps_clip).int(), loss_mask))
+    metrics_add(metrics, "clip_fraction_high", masked_mean((weights > 1 + eps_clip_high).int(), loss_mask))
     return weights.clamp(1 - eps_clip, 1 + eps_clip_high)
 
 
 def clip_to_zero(
     weights: torch.Tensor, loss_mask: torch.Tensor, metrics: Dict[str, Any], *, eps_clip: float, eps_clip_high: float
 ) -> torch.Tensor:
-    metrics["mean"] += masked_mean(weights, loss_mask)
-    metrics["clip_fraction_low"] += masked_mean((weights < 1 - eps_clip).int(), loss_mask)
-    metrics["clip_fraction_high"] += masked_mean((weights > 1 + eps_clip_high).int(), loss_mask)
+    metrics_add(metrics, "mean", masked_mean(weights, loss_mask))
+    metrics_add(metrics, "clip_fraction_low", masked_mean((weights < 1 - eps_clip).int(), loss_mask))
+    metrics_add(metrics, "clip_fraction_high", masked_mean((weights > 1 + eps_clip_high).int(), loss_mask))
     clip_mask = (weights >= 1 - eps_clip) & (weights <= 1 + eps_clip_high)
     return weights * clip_mask
 
