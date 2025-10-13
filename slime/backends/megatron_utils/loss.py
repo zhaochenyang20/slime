@@ -17,12 +17,7 @@ from slime.utils.ppo_utils import (
 )
 from slime.utils.tis import clip, clip_to_zero, compute_train_infer_tis_weights, truncate
 
-from .cp_utils import (
-    all_gather_with_cp,
-    get_logits_and_tokens_offset_with_cp,
-    get_sum_of_sample_mean,
-    slice_log_prob_with_cp,
-)
+from .cp_utils import all_gather_with_cp, get_logits_and_tokens_offset_with_cp, get_sum_of_sample_mean
 
 
 def get_responses(
@@ -367,17 +362,7 @@ def policy_loss_function(args, batch, logits, sum_of_sample_mean):
 
         ois = (-ppo_kl).exp()
 
-        # tis_weights is a 1D tensor, should be sliced to the local cp rank
-        local_tis_chunks = []
-        start = 0
-        for total_len, response_len in zip(total_lengths, response_lengths):
-            end = start + int(response_len)
-            seq_weights = tis_weights[start:end]
-            # Slice to the two local chunks of this CP rank
-            local_chunk = slice_log_prob_with_cp(seq_weights, int(total_len), int(response_len))
-            local_tis_chunks.append(local_chunk)
-            start = end
-        tis_weights = torch.cat(local_tis_chunks, dim=0)
+        tis_weights = torch.cat(tis_weights, dim=0)
 
         pg_loss = pg_loss * tis_weights
 
