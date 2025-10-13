@@ -311,7 +311,7 @@ def policy_loss_function(args, batch, logits, sum_of_sample_mean):
     pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, args.eps_clip, args.eps_clip_high)
 
     # Apply TIS off-policy correction using importance sampling if enabled
-    if args.use_tis:
+    if args.use_train_infer_tis:
         assert "rollout_log_probs" in batch, "rollout_log_probs must be provided for TIS"
 
         rollout_log_probs = batch["rollout_log_probs"]
@@ -326,24 +326,13 @@ def policy_loss_function(args, batch, logits, sum_of_sample_mean):
             for old_log_prob, total_length, response_length in zip(old_log_probs, total_lengths, response_lengths)
         ]
 
-        # old_log_probs, log_probs, loss_masks are all concated into 1D tensor
-        full_old_log_probs_flat = torch.cat(full_old_log_probs, dim=0)
-        full_rollout_log_probs = torch.cat(full_rollout_log_probs, dim=0)
-        # loss_mask is not sliced by cp, so no need to all_gather
-        full_loss_masks_flat = torch.cat(batch["loss_masks"], dim=0)
-
         tis_weights, tis_metrics = compute_tis_weights(
-            old_log_prob_flat=full_old_log_probs_flat,
-            rollout_log_prob_flat=full_rollout_log_probs,
-            loss_mask_flat=full_loss_masks_flat,
-            level=getattr(args, "tis_level", "token"),
-            mode=getattr(args, "tis_mode", "truncate"),
-            upper_threshold=getattr(args, "tis_threshold_upper", 2.0),
-            lower_threshold=getattr(args, "tis_threshold_lower", 1.0 / getattr(args, "tis_threshold_upper", 2.0)),
-            veto_threshold=getattr(args, "tis_veto_threshold", 1e-4),
-            safety_bound=getattr(args, "tis_safety_bound", 20.0),
+            args=args,
+            new_log_probs=full_old_log_probs,
+            old_log_probs=full_rollout_log_probs,
+            loss_masks=batch["loss_masks"],
             response_lengths=response_lengths,
-            total_lengths=total_lengths,
+            prefix="train_infer",
         )
 
         ois = (-ppo_kl).exp()
@@ -400,9 +389,15 @@ def policy_loss_function(args, batch, logits, sum_of_sample_mean):
     if args.use_kl_loss:
         reported_loss["kl_loss"] = kl_loss.clone().detach()
 
-    if args.use_tis:
+    if args.use_train_infer_tis:
         # Backward compatible basic logs
         reported_loss["ois"] = sum_of_sample_mean(ois).clone().detach()
+        for metric_key, metric_value in tis_metrics.items():
+            key_name = f"train_infer_{metric_key}"
+            if torch.is_tensor(metric_value):
+                reported_loss[key_name] = metric_value.clone().detach()
+            elif isinstance(metric_value, (int, float)):
+                reported_loss[key_name] = torch.tensor(metric_value, device=log_probs.device)
 
     return loss, reported_loss
 

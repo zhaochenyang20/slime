@@ -25,6 +25,61 @@ def reset_arg(parser, name, **kwargs):
         parser.add_argument(name, **kwargs)
 
 
+def add_tis_arguments(parser: argparse.ArgumentParser):
+    # Off-Policy Correction using Importance Sampling: https://fengyao.notion.site/off-policy-rl
+    parser.add_argument(
+        "--use-train-infer-tis",
+        action="store_true",
+        default=False,
+        help="Enable TIS from https://fengyao.notion.site/off-policy-rl for off-policy importance sampling.",
+    )
+
+    # Extended TIS controls (levels/modes/thresholds) with backward compatibility
+    parser.add_argument(
+        "--train-infer-tis-level",
+        type=str,
+        choices=["token", "sequence", "geometric"],
+        default="token",
+        help=(
+            "Aggregation level for importance sampling weights: token (per-token), "
+            "sequence (product over tokens), geometric (geometric mean)."
+        ),
+    )
+    parser.add_argument(
+        "--train-infer-tis-mode",
+        type=str,
+        choices=["truncate", "clip"],
+        default="truncate",
+        help=(
+            "Handling mode for IS weights: truncate (cap upper bound, TIS) or clip "
+            "(zero outside [lower, upper], CIS)."
+        ),
+    )
+    parser.add_argument(
+        "--train-infer-tis-eps-clip",
+        type=float,
+        default=0.2,
+        help=(
+            "Lower clip threshold for IS weights. Default is 0.2. "
+            "For clip mode uses this value; for truncate mode remains unused."
+        ),
+    )
+    parser.add_argument(
+        "--train-infer-tis-eps-clip-high",
+        type=float,
+        default=None,
+        help=("Upper clip threshold for IS weights. Default is None."),
+    )
+    parser.add_argument(
+        "--train-infer-tis-veto-threshold",
+        type=float,
+        default=1e-4,
+        help=("Per-token veto threshold. If any token ratio < this, zero the entire sequence weight."),
+    )
+
+    return parser
+
+
 def get_slime_extra_args_provider(add_custom_arguments=None):
     def add_slime_arguments(parser):
         # Ray
@@ -659,62 +714,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "This is useful for doing special loss mask."
                 ),
             )
-            # Off-Policy Correction using Importance Sampling: https://fengyao.notion.site/off-policy-rl
-            parser.add_argument(
-                "--use-tis",
-                action="store_true",
-                default=False,
-                help="Enable TIS from https://fengyao.notion.site/off-policy-rl for off-policy importance sampling.",
-            )
-
-            # Extended TIS controls (levels/modes/thresholds) with backward compatibility
-            parser.add_argument(
-                "--tis-level",
-                type=str,
-                choices=["token", "sequence", "geometric"],
-                default="token",
-                help=(
-                    "Aggregation level for importance sampling weights: token (per-token), "
-                    "sequence (product over tokens), geometric (geometric mean)."
-                ),
-            )
-            parser.add_argument(
-                "--tis-mode",
-                type=str,
-                choices=["truncate", "clip"],
-                default="truncate",
-                help=(
-                    "Handling mode for IS weights: truncate (cap upper bound, TIS) or clip "
-                    "(zero outside [lower, upper], CIS)."
-                ),
-            )
-            parser.add_argument(
-                "--tis-threshold-upper",
-                type=float,
-                default=2.0,
-                help=("Upper threshold for IS weights. Default is 2.0."),
-            )
-            parser.add_argument(
-                "--tis-threshold-lower",
-                type=float,
-                default=0.0,
-                help=(
-                    "Lower threshold for IS weights. Default is 0.0. "
-                    "For clip mode uses this value; for truncate mode remains unused."
-                ),
-            )
-            parser.add_argument(
-                "--tis-veto-threshold",
-                type=float,
-                default=1e-4,
-                help=("Per-token veto threshold. If any token ratio < this, zero the entire sequence weight."),
-            )
-            parser.add_argument(
-                "--tis-safety-bound",
-                type=float,
-                default=20.0,
-                help=("Safety clamp for log-space ratio to avoid numerical overflow (exp(20) ~= 4.85e8)."),
-            )
 
             parser.add_argument(
                 "--use-routing-replay",
@@ -1018,6 +1017,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         parser = add_reward_model_arguments(parser)
         parser = add_rollout_buffer_arguments(parser)
         parser = add_ci_arguments(parser)
+        parser = add_tis_arguments(parser)
 
         # For megatron
         parser = add_custom_megatron_plugins_arguments(parser)
@@ -1150,6 +1150,9 @@ def slime_validate_args(args):
 
     if args.eps_clip_high is None:
         args.eps_clip_high = args.eps_clip
+
+    if args.train_infer_tis_eps_clip_high is None:
+        args.train_infer_tis_eps_clip_high = args.train_infer_tis_eps_clip
 
     if args.eval_reward_key is None:
         args.eval_reward_key = args.reward_key
