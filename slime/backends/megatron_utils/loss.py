@@ -1,3 +1,4 @@
+from functools import partial
 from typing import Union
 
 import torch
@@ -14,7 +15,7 @@ from slime.utils.ppo_utils import (
     get_reinforce_plus_plus_baseline_advantages,
     get_reinforce_plus_plus_returns,
 )
-from slime.utils.tis import compute_tis_weights
+from slime.utils.tis import clip, clip_to_zero, compute_train_infer_tis_weights, truncate
 
 from .cp_utils import (
     all_gather_with_cp,
@@ -326,13 +327,42 @@ def policy_loss_function(args, batch, logits, sum_of_sample_mean):
             for old_log_prob, total_length, response_length in zip(old_log_probs, total_lengths, response_lengths)
         ]
 
-        tis_weights, tis_metrics = compute_tis_weights(
+        """    
+        mode: how to handle the importance sampling weights exceeding the thresholds.
+        - "truncated": cap the importance sampling weights at the upper threshold
+          https://fengyao.notion.site/off-policy-rl#279721e3f6c48092bbe2fcfe0e9c6b33
+        - "clip_to_zero": zero the importance sampling weights outside the [lower, upper] range.
+          https://yingru.notion.site/When-Speed-Kills-Stability-Demystifying-RL-Collapse-from-the-Training-Inference-Mismatch-271211a558b7808d8b12d403fd15edda
+        - "clip": clip the importance sampling weights to the [lower, upper] range.
+        """
+
+        if args.train_infer_tis_mode == "clip_to_zero":
+            assert (
+                args.train_infer_tis_eps_clip is not None and args.train_infer_tis_eps_clip_high is not None
+            ), "eps_clip and eps_clip_high must be provided"
+            tis_function = partial(
+                clip_to_zero, eps_clip=args.train_infer_tis_eps_clip, eps_clip_high=args.train_infer_tis_eps_clip_high
+            )
+        elif args.train_infer_tis_mode == "clip":
+            assert (
+                args.train_infer_tis_eps_clip is not None and args.train_infer_tis_eps_clip_high is not None
+            ), "eps_clip and eps_clip_high must be provided"
+            tis_function = partial(
+                clip, eps_clip=args.train_infer_tis_eps_clip, eps_clip_high=args.train_infer_tis_eps_clip_high
+            )
+        elif args.train_infer_tis_mode == "truncate":
+            assert args.train_infer_tis_eps_clip is not None, "eps_clip must be provided"
+            tis_function = partial(truncate, eps=args.train_infer_tis_eps_clip)
+        else:
+            raise ValueError(f"Unsupported train_infer_tis_mode: {args.train_infer_tis_mode}")
+
+        tis_weights, tis_metrics = compute_train_infer_tis_weights(
             args=args,
             new_log_probs=full_old_log_probs,
             old_log_probs=full_rollout_log_probs,
             loss_masks=batch["loss_masks"],
             response_lengths=response_lengths,
-            prefix="train_infer",
+            tis_function=tis_function,
         )
 
         ois = (-ppo_kl).exp()

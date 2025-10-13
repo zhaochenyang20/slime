@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
 
@@ -21,10 +21,54 @@ def masked_mean(
     return total / (denom + eps)
 
 
-SAFETY_BOUND = 20.0
+def calculate_veto_mask(
+    log_ratio_for_metrics: torch.Tensor,
+    loss_mask: torch.Tensor,
+    veto_threshold: Optional[float],
+    metrics: Dict[str, Any],
+) -> torch.Tensor:
+    if veto_threshold is None:
+        return torch.ones_like(log_ratio_for_metrics)
+    log_veto_threshold = torch.log(torch.tensor(veto_threshold, device=log_ratio_for_metrics.device))
+    # For each sequence, check if it has any catastrophic tokens
+    catastrophic_tokens = (
+        (log_ratio_for_metrics < log_veto_threshold) | (log_ratio_for_metrics > 1 / log_veto_threshold)
+    ) & loss_mask.bool()
+    has_catastrophic = catastrophic_tokens.any()
+    # Create veto mask: 0 if sequence has catastrophic tokens, 1 otherwise
+    veto_mask = (~has_catastrophic).float().expand_as(log_ratio_for_metrics)
+
+    # Update metrics
+    metrics["catastrophic_ratio"] += masked_mean(has_catastrophic.int(), loss_mask)
+    return veto_mask
 
 
-def compute_tis_weights(
+def truncate(weights: torch.Tensor, loss_mask: torch.Tensor, metrics: Dict[str, Any], *, eps: float) -> torch.Tensor:
+    metrics["mean"] += masked_mean(weights, loss_mask)
+    metrics["truncate_fraction"] += masked_mean((weights > eps).int(), loss_mask)
+    return weights.clamp(0, eps) * loss_mask
+
+
+def clip(
+    weights: torch.Tensor, loss_mask: torch.Tensor, metrics: Dict[str, Any], *, eps_clip: float, eps_clip_high: float
+) -> torch.Tensor:
+    metrics["mean"] += masked_mean(weights, loss_mask)
+    metrics["clip_fraction_low"] += masked_mean((weights < 1 - eps_clip).int(), loss_mask)
+    metrics["clip_fraction_high"] += masked_mean((weights > 1 + eps_clip_high).int(), loss_mask)
+    return weights.clamp(1 - eps_clip, 1 + eps_clip_high)
+
+
+def clip_to_zero(
+    weights: torch.Tensor, loss_mask: torch.Tensor, metrics: Dict[str, Any], *, eps_clip: float, eps_clip_high: float
+) -> torch.Tensor:
+    metrics["mean"] += masked_mean(weights, loss_mask)
+    metrics["clip_fraction_low"] += masked_mean((weights < 1 - eps_clip).int(), loss_mask)
+    metrics["clip_fraction_high"] += masked_mean((weights > 1 + eps_clip_high).int(), loss_mask)
+    clip_mask = (weights >= 1 - eps_clip) & (weights <= 1 + eps_clip_high)
+    return weights * clip_mask
+
+
+def compute_train_infer_tis_weights(
     args,
     *,
     new_log_probs: list[torch.Tensor],
@@ -32,6 +76,7 @@ def compute_tis_weights(
     loss_masks: list[torch.Tensor],
     response_lengths: Optional[list[int]] = None,
     prefix: str = "",
+    tis_function: Callable[[torch.Tensor, torch.Tensor, Dict[str, Any]], torch.Tensor] = None,
 ) -> Tuple[list[torch.Tensor], Dict[str, Any]]:
     """
     Compute the truncated importance sampling (TIS) weights and metrics.
@@ -66,21 +111,9 @@ def compute_tis_weights(
         - "token": per-token importance sampling weights, biased low variance.
         - "sequence": product over tokens, unbiased but high variance.
         - "geometric": geometric mean over tokens, biased, medium variance.
-    mode: how to handle the importance sampling weights exceeding the thresholds.
-        - "truncate": cap the importance sampling weights at the upper threshold, i.e., truncated importance sampling.
-        - "clip": zero the importance sampling weights outside the [lower, upper] range.
-    eps_clip: The lower clip threshold for the importance sampling weights.
-    eps_clip_high: The upper clip threshold for the importance sampling weights.
-    Clip ratio between [1 - eps_clip, 1 + eps_clip_high]
-    When token ratio is out of [veto_threshold, 1 / veto_threshold], the sequence will be masked.
     """
-    level: str = getattr(args, prefix + "_tis_level", "token")
-    mode: str = getattr(args, prefix + "_tis_mode", "truncate")
-    eps_clip: Optional[float] = getattr(args, prefix + "_tis_eps_clip", None)
-    eps_clip_high: Optional[float] = getattr(args, prefix + "_tis_eps_clip_high", None)
-    veto_threshold: Optional[float] = getattr(args, prefix + "_tis_veto_threshold", None)
-
-    assert eps_clip is not None and eps_clip_high is not None, "eps_clip and eps_clip_high must be provided"
+    level: str = args.train_infer_tis_level
+    metrics: Dict[str, Any] = {}
 
     # Validate input lists have same length and each sequence has matching shapes
     assert (
@@ -92,12 +125,11 @@ def compute_tis_weights(
             old.shape == new.shape == mask.shape
         ), f"Sequence {i}: shapes must match - old: {old.shape}, new: {new.shape}, mask: {mask.shape}"
 
-    # Get device from first tensor
-    device = old_log_probs[0].device
-
+    # TODO: Get device from first tensor and apply to tensors
+    # device = old_log_probs[0].device
+    SAFETY_BOUND = 20.0
     all_weights = []
 
-    # Process each sequence individually
     for old_log_prob, new_log_prob, loss_mask in zip(old_log_probs, new_log_probs, loss_masks):
         raw_log_ratio = old_log_prob - new_log_prob
 
@@ -118,27 +150,11 @@ def compute_tis_weights(
         log_ratio_safe = torch.clamp(log_ratio_for_metrics, min=-SAFETY_BOUND, max=SAFETY_BOUND)
         weights = torch.exp(log_ratio_safe)
 
-        if veto_threshold is not None:
-            log_veto_threshold = torch.log(torch.tensor(veto_threshold, device=device))
-            # For each sequence, check if it has any catastrophic tokens
-            catastrophic_tokens = (
-                (log_ratio_for_metrics < log_veto_threshold) | (log_ratio_for_metrics > 1 / log_veto_threshold)
-            ) & loss_mask.bool()
-            has_catastrophic = catastrophic_tokens.any()
-            # Create veto mask: 0 if sequence has catastrophic tokens, 1 otherwise
-            veto_mask = (~has_catastrophic).float()
-        else:
-            catastrophic_tokens = torch.zeros_like(log_ratio_for_metrics, dtype=torch.bool)
-            has_catastrophic = False
-            veto_mask = torch.ones_like(weights)
+        veto_mask = calculate_veto_mask(log_ratio_for_metrics, loss_mask, args.train_infer_tis_veto_threshold, metrics)
+        loss_mask = loss_mask & veto_mask  # mask out catastrophic tokens
 
-        if mode == "clip":
-            weights = weights.clamp(1 - eps_clip, 1 + eps_clip_high)
-            # TODO: which mode should be masked importance sampling?
-        else:
-            raise ValueError(f"Invalid tis mode: {mode}")
+        weights = tis_function(weights, loss_mask, metrics)
 
-        weights = weights * veto_mask
         weights = weights * loss_mask
         weights = weights.detach()
 
