@@ -356,12 +356,12 @@ def policy_loss_function(args, batch, logits, sum_of_sample_mean):
             train_log_probs=full_old_log_probs,
             rollout_log_probs=full_rollout_log_probs,
             loss_masks=batch["loss_masks"],
+            total_lengths=total_lengths,
             response_lengths=response_lengths,
             tis_function=tis_function,
         )
 
         ois = (-ppo_kl).exp()
-        tis = tis_weights
         pg_loss = pg_loss * tis_weights
 
     pg_loss = sum_of_sample_mean(pg_loss)
@@ -405,7 +405,6 @@ def policy_loss_function(args, batch, logits, sum_of_sample_mean):
     if args.use_train_infer_tis:
         # Backward compatible basic logs
         reported_loss["ois"] = sum_of_sample_mean(ois).clone().detach()
-        reported_loss["tis"] = sum_of_sample_mean(tis).clone().detach()
         for metric_key, metric_value in tis_metrics.items():
             key_name = f"train_infer_{metric_key}"
             reported_loss[key_name] = sum_of_sample_mean(metric_value).clone().detach()

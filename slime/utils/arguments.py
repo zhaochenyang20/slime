@@ -73,7 +73,7 @@ def add_tis_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--train-infer-tis-veto-threshold",
         type=float,
-        default=1e-4,
+        default=None,
         help=("Per-token veto threshold. If any token ratio < this, zero the entire sequence weight."),
     )
 

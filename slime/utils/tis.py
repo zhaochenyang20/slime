@@ -1,7 +1,7 @@
 from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
-from slime.backends.megatron_utils.cp_utils import slice_with_cp
+from slime.backends.megatron_utils.cp_utils import scatter_with_cp
 
 
 def masked_sum(
@@ -31,13 +31,14 @@ def metrics_add(metrics: Dict[str, Any], key: str, value: float) -> None:
 def metrics_append(metrics: Dict[str, Any], key: str, value: torch.Tensor) -> None:
     if key not in metrics:
         metrics[key] = []
-    metrics[key].append(slice_with_cp(value.clone().detach(), 0))
+    metrics[key].append(value.clone().detach())
 
 
-def metrics_concat(metrics: Dict[str, Any]) -> None:
-    for key, values in metrics.items():
-        assert isinstance(values, list), f"Metric {key} is not a list"
-        metrics[key] = torch.cat(values, dim=0)
+def scatter_cp_and_concat(
+    values: list[torch.Tensor], total_lengths: list[int], response_lengths: list[int]
+) -> list[torch.Tensor]:
+    values = [scatter_with_cp(values[i], total_lengths[i], response_lengths[i]) for i in range(len(values))]
+    return torch.cat(values, dim=0)
 
 
 def calculate_veto_mask(
@@ -56,14 +57,13 @@ def calculate_veto_mask(
     has_catastrophic = catastrophic_tokens.any()
     veto_mask = (~has_catastrophic).float().expand_as(log_ratio_for_metrics)
 
-    # Update metrics
     metrics_append(metrics, "catastrophic_fraction", has_catastrophic.int().expand_as(loss_mask))
     return veto_mask
 
 
 def truncate(weights: torch.Tensor, loss_mask: torch.Tensor, metrics: Dict[str, Any], *, eps: float) -> torch.Tensor:
     metrics_append(metrics, "truncate_fraction", (weights > eps).int())
-    return weights.clamp(0, eps)
+    return weights.clamp(0, eps) * loss_mask
 
 
 def clip(
@@ -71,7 +71,7 @@ def clip(
 ) -> torch.Tensor:
     metrics_append(metrics, "clip_fraction_low", (weights < 1 - eps_clip).int())
     metrics_append(metrics, "clip_fraction_high", (weights > 1 + eps_clip_high).int())
-    return weights.clamp(1 - eps_clip, 1 + eps_clip_high)
+    return weights.clamp(1 - eps_clip, 1 + eps_clip_high) * loss_mask
 
 
 def clip_to_zero(
@@ -80,7 +80,7 @@ def clip_to_zero(
     metrics_append(metrics, "clip_fraction_low", (weights < 1 - eps_clip).int())
     metrics_append(metrics, "clip_fraction_high", (weights > 1 + eps_clip_high).int())
     clip_mask = (weights >= 1 - eps_clip) & (weights <= 1 + eps_clip_high)
-    return weights * clip_mask
+    return weights * clip_mask * loss_mask
 
 
 def compute_train_infer_tis_weights(
@@ -89,8 +89,8 @@ def compute_train_infer_tis_weights(
     train_log_probs: list[torch.Tensor],
     rollout_log_probs: list[torch.Tensor],
     loss_masks: list[torch.Tensor],
+    total_lengths: Optional[list[int]] = None,
     response_lengths: Optional[list[int]] = None,
-    prefix: str = "",
     tis_function: Callable[[torch.Tensor, torch.Tensor, Dict[str, Any]], torch.Tensor],
 ) -> Tuple[list[torch.Tensor], Dict[str, Any]]:
     """
@@ -108,7 +108,6 @@ def compute_train_infer_tis_weights(
             Note that for single turn RL, the loss_mask is [1] * response_length for each sequence
             For multi turn RL, the tool response will be marked as 0 in the loss_mask.
         response_lengths: The length of the response for each sequence.
-        prefix: The prefix for the parameters, indicating which tis is used.
 
     Returns:
         weights: The importance sampling weights. [batch_size, seq_len]
@@ -128,6 +127,12 @@ def compute_train_infer_tis_weights(
     assert (
         len(train_log_probs) == len(rollout_log_probs) == len(loss_masks)
     ), f"Input lists must have same length: {len(train_log_probs)} vs {len(rollout_log_probs)} vs {len(loss_masks)}"
+
+    if total_lengths is not None:
+        assert response_lengths is not None, "response_lengths must be provided when total_lengths is set"
+        assert len(total_lengths) == len(
+            train_log_probs
+        ), f"total_lengths must match number of sequences, got {len(total_lengths)} vs {len(train_log_probs)}"
 
     for i, (train, rollout, mask) in enumerate(zip(train_log_probs, rollout_log_probs, loss_masks)):
         assert (
@@ -168,73 +173,17 @@ def compute_train_infer_tis_weights(
 
         metrics_append(metrics, "raw_ratio_mean", weights)
         weights = tis_function(weights, loss_mask, metrics)
-        weights = weights * loss_mask
         metrics_append(metrics, "ratio_mean_after_tis", weights)
         if args.train_infer_tis_veto_threshold is not None:
             weights = weights * veto_mask
             metrics_append(metrics, "ratio_mean_after_veto_mask", weights)
 
         weights = weights.detach()
+        all_weights.append(weights)
 
-        all_weights.append(slice_with_cp(weights, 0))
-
-    all_weights = torch.cat(all_weights, dim=0)
-    metrics_concat(metrics)
+    all_weights = scatter_cp_and_concat(all_weights, total_lengths, response_lengths)
+    for key, values in metrics.items():
+        values = scatter_cp_and_concat(values, total_lengths, response_lengths)
+        metrics[key] = values
 
     return all_weights, metrics
-
-
-# def compute_kl_metrics(
-#     *,
-#     train_log_prob: torch.Tensor,
-#     rollout_log_prob: torch.Tensor,
-#     loss_mask: Optional[torch.Tensor],
-#     response_lengths: Optional[list[int]] = None,
-# ) -> Dict[str, Any]:
-#     metrics: Dict[str, Any] = {}
-
-#     device = train_log_prob.device
-#     if loss_mask is None:
-#         loss_mask = torch.ones_like(train_log_prob, dtype=torch.bool, device=device)
-
-#     # Direct estimator for KL(pi_rollout || pi_old): per-seq mean then sum (1D inputs only)
-#     assert response_lengths is not None and loss_mask is not None
-#     sequence_log_ratios = torch.split(rollout_log_prob - train_log_prob, [int(l) for l in response_lengths], dim=0)
-#     sequence_loss_masks = torch.split(loss_mask, [int(l) for l in response_lengths], dim=0)
-#     per_seq = [
-#         masked_mean(sequence_log_ratio, sequence_loss_mask)
-#         for sequence_log_ratio, sequence_loss_mask in zip(sequence_log_ratios, sequence_loss_masks)
-#     ]
-#     metrics["rollout_kl"] = torch.stack(per_seq).sum()
-
-#     # K3 estimator: E[exp(log(pi_old/pi_rollout)) - log(pi_old/pi_rollout) - 1]
-#     log_ratio = train_log_prob - rollout_log_prob
-#     k3_matrix = torch.exp(log_ratio) - log_ratio - 1
-#     sequence_log_ratios = torch.split(k3_matrix, [int(l) for l in response_lengths], dim=0)
-#     sequence_loss_masks = torch.split(loss_mask, [int(l) for l in response_lengths], dim=0)
-#     per_seq = [
-#         masked_mean(sequence_log_ratio, sequence_loss_mask)
-#         for sequence_log_ratio, sequence_loss_mask in zip(sequence_log_ratios, sequence_loss_masks)
-#     ]
-#     metrics["rollout_k3_kl"] = torch.stack(per_seq).sum()
-
-#     # Sequence-level perplexity difference metrics
-#     assert response_lengths is not None and len(response_lengths) > 0
-#     seq_rollout_means = []
-#     seq_train_means = []
-#     start = 0
-#     for length in response_lengths:
-#         end = start + int(length)
-#         mask_chunk = loss_mask[start:end]
-#         seq_rollout_means.append(masked_mean(rollout_log_prob[start:end], mask_chunk))
-#         seq_train_means.append(masked_mean(train_log_prob[start:end], mask_chunk))
-#         start = end
-#     mean_log_prob_rollout_per_seq = torch.stack(seq_rollout_means)
-#     mean_log_prob_train_per_seq = torch.stack(seq_train_means)
-
-#     diff = mean_log_prob_rollout_per_seq - mean_log_prob_train_per_seq
-#     # report sums; external reducer divides by num_samples
-#     metrics["log_ppl_diff"] = diff.sum()
-#     metrics["log_ppl_abs_diff"] = diff.abs().sum()
-
-#     return metrics
