@@ -62,9 +62,6 @@ def calculate_veto_mask(
     has_catastrophic = catastrophic_tokens.any()
     veto_mask = (~has_catastrophic).float().expand_as(log_ratio_for_metrics)
 
-    # TODO(jiajun): A single catastrophic token may not be enough to veto the entire sequence?
-    # May be we can set a threshold for the ratio of catastrophic tokens?
-    # If exceeds, veto the entire sequence. If not, only mask the catastrophic tokens.
     metrics_append(metrics, "catastrophic_token_fraction", catastrophic_tokens.int())
     metrics_append(metrics, "catastrophic_seq_fraction", has_catastrophic.int().expand_as(loss_mask))
     return veto_mask
@@ -115,14 +112,14 @@ def compute_train_infer_is_weights(
     """
     Compute the truncated importance sampling (TIS) weights and metrics.
     Args:
-        train_log_probs: List of log probs from training backend.
-        rollout_log_probs: List of log probs from inference backend.
-        loss_masks: List of loss masks.
-            Note that for single turn RL, the loss_mask is [1] * response_length for each sequence
+        train_log_probs: List of log probs from training backend (1D tensor)
+        rollout_log_probs: List of log probs from inference backend (1D tensor)
+        loss_masks: List of loss masks (1D tensor)
+            Note that for single turn RL, the loss_mask is [1] * response_length for each sequence (1D tensor)
             For multi turn RL, the tool response will be marked as 0 in the loss_mask.
 
     Returns:
-        weights: The importance sampling weights. [batch_size, seq_len]
+        weights: List of importance sampling weights (1D tensor)
         metrics: The metrics for the importance sampling weights.
     """
 
@@ -154,11 +151,11 @@ def compute_train_infer_is_weights(
         elif level == "sequence":
             # Product of ratios (unbiased)
             agg_log_ratio = (raw_log_ratio * loss_mask).sum()
-            log_ratio_for_metrics = torch.full_like(raw_log_ratio, agg_log_ratio)
+            log_ratio_for_metrics = agg_log_ratio.expand_as(raw_log_ratio)
         elif level == "geometric":
             # Geometric mean of ratios (experimental)
             agg_log_ratio = (raw_log_ratio * loss_mask).sum() / torch.clamp_min(loss_mask.sum(), 1)
-            log_ratio_for_metrics = torch.full_like(raw_log_ratio, agg_log_ratio)
+            log_ratio_for_metrics = agg_log_ratio.expand_as(raw_log_ratio)
         else:
             raise ValueError(f"Invalid importance sampling level: {level}")
 
@@ -167,9 +164,7 @@ def compute_train_infer_is_weights(
 
         # mask out catastrophic tokens
         if args.train_infer_is_veto_threshold is not None:
-            veto_mask = calculate_veto_mask(
-                log_ratio_for_metrics, loss_mask, args.train_infer_is_veto_threshold, metrics
-            )
+            veto_mask = calculate_veto_mask(raw_log_ratio, loss_mask, args.train_infer_is_veto_threshold, metrics)
 
         metrics_append(metrics, "raw_ratio_mean", weights)
 
@@ -224,9 +219,9 @@ def compute_train_infer_is_weights_with_cp(
     """
     Compute the truncated importance sampling (TIS) weights and metrics with context parallel.
     Args:
-        train_log_probs: List of log probs from training backend on this cp rank.
-        rollout_log_probs: List of log probs from inference backend on this cp rank.
-        loss_masks: List of loss masks.
+        train_log_probs: List of log probs from training backend on this cp rank (1D tensor)
+        rollout_log_probs: List of log probs from inference backend on this cp rank (1D tensor)
+        loss_masks: List of loss masks (1D tensor)
         total_lengths: List of total lengths.
         response_lengths: List of response lengths.
     Returns:
