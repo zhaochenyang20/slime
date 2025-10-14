@@ -74,7 +74,7 @@ def clip(
     return weights.clamp(1 - eps_clip, 1 + eps_clip_high) * loss_mask
 
 
-def clip_to_zero(
+def clip_mask(
     weights: torch.Tensor, loss_mask: torch.Tensor, metrics: Dict[str, Any], *, eps_clip: float, eps_clip_high: float
 ) -> torch.Tensor:
     metrics_append(metrics, "clip_fraction_low", (weights < 1 - eps_clip).int())
@@ -83,13 +83,13 @@ def clip_to_zero(
     return weights * clip_mask * loss_mask
 
 
-def compute_train_infer_tis_weights(
+def compute_train_infer_is_weights(
     args,
     *,
     train_log_probs: list[torch.Tensor],
     rollout_log_probs: list[torch.Tensor],
     loss_masks: list[torch.Tensor],
-    tis_function: Callable[[torch.Tensor, torch.Tensor, Dict[str, Any]], torch.Tensor],
+    is_function: Callable[[torch.Tensor, torch.Tensor, Dict[str, Any]], torch.Tensor],
 ) -> Tuple[list[torch.Tensor], Dict[str, Any]]:
     """
     Compute the truncated importance sampling (TIS) weights and metrics.
@@ -111,7 +111,7 @@ def compute_train_infer_tis_weights(
         - "sequence": product over tokens, unbiased but high variance.
         - "geometric": geometric mean over tokens, biased, medium variance.
     """
-    level: str = args.train_infer_tis_level
+    level: str = args.train_infer_is_level
     metrics: Dict[str, Any] = {}
 
     # Validate input lists have same length and each sequence has matching shapes
@@ -151,15 +151,15 @@ def compute_train_infer_tis_weights(
         weights = torch.exp(log_ratio_safe)
 
         # mask out catastrophic tokens
-        if args.train_infer_tis_veto_threshold is not None:
+        if args.train_infer_is_veto_threshold is not None:
             veto_mask = calculate_veto_mask(
-                log_ratio_for_metrics, loss_mask, args.train_infer_tis_veto_threshold, metrics
+                log_ratio_for_metrics, loss_mask, args.train_infer_is_veto_threshold, metrics
             )
 
         metrics_append(metrics, "raw_ratio_mean", weights)
-        weights = tis_function(weights, loss_mask, metrics)
+        weights = is_function(weights, loss_mask, metrics)
         metrics_append(metrics, "ratio_mean_after_tis", weights)
-        if args.train_infer_tis_veto_threshold is not None:
+        if args.train_infer_is_veto_threshold is not None:
             weights = weights * veto_mask
             metrics_append(metrics, "ratio_mean_after_veto_mask", weights)
 

@@ -25,10 +25,11 @@ def reset_arg(parser, name, **kwargs):
         parser.add_argument(name, **kwargs)
 
 
-def add_tis_arguments(parser: argparse.ArgumentParser):
-    # Off-Policy Correction using Importance Sampling: https://fengyao.notion.site/off-policy-rl
+def add_is_arguments(parser: argparse.ArgumentParser):
+    # Off-Policy Correction arguments for importance sampling
+    # training/inference importance sampling
     parser.add_argument(
-        "--use-train-infer-tis",
+        "--use-train-infer-is",
         action="store_true",
         default=False,
         help="Enable TIS from https://fengyao.notion.site/off-policy-rl for off-policy importance sampling.",
@@ -36,7 +37,7 @@ def add_tis_arguments(parser: argparse.ArgumentParser):
 
     # Extended TIS controls (levels/modes/thresholds) with backward compatibility
     parser.add_argument(
-        "--train-infer-tis-level",
+        "--train-infer-is-level",
         type=str,
         choices=["token", "sequence", "geometric"],
         default="token",
@@ -46,7 +47,7 @@ def add_tis_arguments(parser: argparse.ArgumentParser):
         ),
     )
     parser.add_argument(
-        "--train-infer-tis-mode",
+        "--train-infer-is-mode",
         type=str,
         choices=["truncate", "clip"],
         default="truncate",
@@ -56,19 +57,19 @@ def add_tis_arguments(parser: argparse.ArgumentParser):
         ),
     )
     parser.add_argument(
-        "--train-infer-tis-eps-clip",
+        "--train-infer-is-eps-clip",
         type=float,
         default=0.2,
         help=("Lower clip threshold for IS weights. Default is 0.2. "),
     )
     parser.add_argument(
-        "--train-infer-tis-eps-clip-high",
+        "--train-infer-is-eps-clip-high",
         type=float,
         default=None,
         help=("Upper clip threshold for IS weights. Default is None. Truncate mode will not use this value."),
     )
     parser.add_argument(
-        "--train-infer-tis-veto-threshold",
+        "--train-infer-is-veto-threshold",
         type=float,
         default=None,
         help=("Per-token veto threshold. If any token ratio < this or > 1/this, zero the entire sequence weight."),
@@ -1014,7 +1015,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         parser = add_reward_model_arguments(parser)
         parser = add_rollout_buffer_arguments(parser)
         parser = add_ci_arguments(parser)
-        parser = add_tis_arguments(parser)
+        parser = add_is_arguments(parser)
 
         # For megatron
         parser = add_custom_megatron_plugins_arguments(parser)
@@ -1148,8 +1149,8 @@ def slime_validate_args(args):
     if args.eps_clip_high is None:
         args.eps_clip_high = args.eps_clip
 
-    if args.train_infer_tis_eps_clip_high is None:
-        args.train_infer_tis_eps_clip_high = args.train_infer_tis_eps_clip
+    if args.train_infer_is_eps_clip_high is None:
+        args.train_infer_is_eps_clip_high = args.train_infer_is_eps_clip
 
     if args.eval_reward_key is None:
         args.eval_reward_key = args.reward_key

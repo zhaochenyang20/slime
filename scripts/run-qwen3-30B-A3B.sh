@@ -65,7 +65,7 @@ PERF_ARGS=(
    --tensor-model-parallel-size 2
    --sequence-parallel
    --pipeline-model-parallel-size 1
-   --context-parallel-size 1
+   --context-parallel-size 2
    --expert-model-parallel-size 4
    --expert-tensor-parallel-size 1
 
@@ -88,12 +88,12 @@ GRPO_ARGS=(
    --eps-clip-high 0.28
 )
 
-TIS_ARGS=(
-   --use-train-infer-tis
-   --train-infer-tis-level token
-   --train-infer-tis-mode clip
-   --train-infer-tis-eps-clip 0.2
-   --train-infer-tis-veto-threshold 1e-4
+IS_ARGS=(
+   --use-train-infer-is
+   --train-infer-is-level token
+   --train-infer-is-mode clip
+   --train-infer-is-eps-clip 0.2
+   --train-infer-is-veto-threshold 1e-4
 )
 
 OPTIMIZER_ARGS=(

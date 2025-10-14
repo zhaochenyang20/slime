@@ -15,7 +15,7 @@ from slime.utils.ppo_utils import (
     get_reinforce_plus_plus_baseline_advantages,
     get_reinforce_plus_plus_returns,
 )
-from slime.utils.tis import clip, clip_to_zero, compute_train_infer_tis_weights, truncate
+from slime.utils.tis import clip, clip_mask, compute_train_infer_is_weights, truncate
 
 from .cp_utils import all_gather_with_cp, get_logits_and_tokens_offset_with_cp, get_sum_of_sample_mean, scatter_with_cp
 
@@ -307,7 +307,7 @@ def policy_loss_function(args, batch, logits, sum_of_sample_mean):
     pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, args.eps_clip, args.eps_clip_high)
 
     # Apply TIS off-policy correction using importance sampling if enabled
-    if args.use_train_infer_tis:
+    if args.use_train_infer_is:
         assert "rollout_log_probs" in batch, "rollout_log_probs must be provided for TIS"
 
         rollout_log_probs = batch["rollout_log_probs"]
@@ -326,37 +326,37 @@ def policy_loss_function(args, batch, logits, sum_of_sample_mean):
         mode: how to handle the importance sampling weights exceeding the thresholds.
         - "truncated": cap the importance sampling weights at the upper threshold
           https://fengyao.notion.site/off-policy-rl#279721e3f6c48092bbe2fcfe0e9c6b33
-        - "clip_to_zero": zero the importance sampling weights outside the [lower, upper] range.
+        - "clip_mask": zero the importance sampling weights outside the [lower, upper] range.
           https://yingru.notion.site/When-Speed-Kills-Stability-Demystifying-RL-Collapse-from-the-Training-Inference-Mismatch-271211a558b7808d8b12d403fd15edda
         - "clip": clip the importance sampling weights to the [lower, upper] range.
         """
 
-        if args.train_infer_tis_mode == "clip_to_zero":
+        if args.train_infer_is_mode == "clip_mask":
             assert (
-                args.train_infer_tis_eps_clip is not None and args.train_infer_tis_eps_clip_high is not None
+                args.train_infer_is_eps_clip is not None and args.train_infer_is_eps_clip_high is not None
             ), "eps_clip and eps_clip_high must be provided"
-            tis_function = partial(
-                clip_to_zero, eps_clip=args.train_infer_tis_eps_clip, eps_clip_high=args.train_infer_tis_eps_clip_high
+            is_function = partial(
+                clip_mask, eps_clip=args.train_infer_is_eps_clip, eps_clip_high=args.train_infer_is_eps_clip_high
             )
-        elif args.train_infer_tis_mode == "clip":
+        elif args.train_infer_is_mode == "clip":
             assert (
-                args.train_infer_tis_eps_clip is not None and args.train_infer_tis_eps_clip_high is not None
+                args.train_infer_is_eps_clip is not None and args.train_infer_is_eps_clip_high is not None
             ), "eps_clip and eps_clip_high must be provided"
-            tis_function = partial(
-                clip, eps_clip=args.train_infer_tis_eps_clip, eps_clip_high=args.train_infer_tis_eps_clip_high
+            is_function = partial(
+                clip, eps_clip=args.train_infer_is_eps_clip, eps_clip_high=args.train_infer_is_eps_clip_high
             )
-        elif args.train_infer_tis_mode == "truncate":
-            assert args.train_infer_tis_eps_clip is not None, "eps_clip must be provided"
-            tis_function = partial(truncate, eps=args.train_infer_tis_eps_clip)
+        elif args.train_infer_is_mode == "truncate":
+            assert args.train_infer_is_eps_clip is not None, "eps_clip must be provided"
+            is_function = partial(truncate, eps=args.train_infer_is_eps_clip)
         else:
-            raise ValueError(f"Unsupported train_infer_tis_mode: {args.train_infer_tis_mode}")
+            raise ValueError(f"Unsupported train_infer_is_mode: {args.train_infer_is_mode}")
 
-        tis_weights, tis_metrics = compute_train_infer_tis_weights(
+        is_weights, is_metrics = compute_train_infer_is_weights(
             args=args,
             train_log_probs=full_old_log_probs,
             rollout_log_probs=full_rollout_log_probs,
             loss_masks=batch["loss_masks"],
-            tis_function=tis_function,
+            is_function=is_function,
         )
 
         def scatter_cp_and_concat(
@@ -366,13 +366,13 @@ def policy_loss_function(args, batch, logits, sum_of_sample_mean):
             values = [scatter_with_cp(values[i], total_lengths[i], response_lengths[i]) for i in range(len(values))]
             return torch.cat(values, dim=0)
 
-        tis_weights = scatter_cp_and_concat(tis_weights, total_lengths, response_lengths)
-        for key, values in tis_metrics.items():
+        is_weights = scatter_cp_and_concat(is_weights, total_lengths, response_lengths)
+        for key, values in is_metrics.items():
             values = scatter_cp_and_concat(values, total_lengths, response_lengths)
-            tis_metrics[key] = values
+            is_metrics[key] = values
 
         ois = (-ppo_kl).exp()
-        pg_loss = pg_loss * tis_weights
+        pg_loss = pg_loss * is_weights
 
     pg_loss = sum_of_sample_mean(pg_loss)
     pg_clipfrac = sum_of_sample_mean(pg_clipfrac)
@@ -412,10 +412,10 @@ def policy_loss_function(args, batch, logits, sum_of_sample_mean):
     if args.use_kl_loss:
         reported_loss["kl_loss"] = kl_loss.clone().detach()
 
-    if args.use_train_infer_tis:
+    if args.use_train_infer_is:
         # Backward compatible basic logs
         reported_loss["ois"] = sum_of_sample_mean(ois).clone().detach()
-        for metric_key, metric_value in tis_metrics.items():
+        for metric_key, metric_value in is_metrics.items():
             key_name = f"train_infer_{metric_key}"
             reported_loss[key_name] = sum_of_sample_mean(metric_value)
 
