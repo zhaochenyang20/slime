@@ -49,12 +49,12 @@ def add_is_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--train-infer-is-mode",
         type=str,
-        choices=["truncate", "clip_mask", "clip"],
+        choices=["truncate", "mask", "clip"],
         default="truncate",
         help=(
             "Handling mode for IS weights:"
             "truncate (cap upper bound, TIS),"
-            "clip_mask (zero outside [lower, upper], CIS),"
+            "mask (zero outside [lower, upper], CIS),"
             "clip (clip to [lower, upper], CIS)."
         ),
     )
@@ -62,15 +62,13 @@ def add_is_arguments(parser: argparse.ArgumentParser):
         "--train-infer-is-lower-bound",
         type=float,
         default=0.5,
-        help=(
-            "For clip or clip_mask mode, the lower bound of the IS weights. For truncate mode, it will not be used."
-        ),
+        help=("For clip or mask mode, the lower bound of the IS weights. For truncate mode, it will not be used."),
     )
     parser.add_argument(
         "--train-infer-is-upper-bound",
         type=float,
         default=2.0,
-        help=("For truncate, clip, and clip_mask mode, the upper bound of the IS weights."),
+        help=("For truncate, clip, and mask mode, the upper bound of the IS weights."),
     )
     parser.add_argument(
         "--train-infer-is-veto-threshold",

@@ -74,13 +74,13 @@ def clip(
     return weights.clamp(lower_bound, upper_bound) * loss_mask
 
 
-def clip_mask(
+def mask(
     weights: torch.Tensor, loss_mask: torch.Tensor, metrics: Dict[str, Any], *, lower_bound: float, upper_bound: float
 ) -> torch.Tensor:
-    metrics_append(metrics, "clip_fraction_low", (weights < lower_bound).int())
-    metrics_append(metrics, "clip_fraction_high", (weights > upper_bound).int())
-    clip_mask = (weights >= lower_bound) & (weights <= upper_bound)
-    return weights * clip_mask * loss_mask
+    metrics_append(metrics, "mask_fraction_low", (weights < lower_bound).int())
+    metrics_append(metrics, "mask_fraction_high", (weights > upper_bound).int())
+    mask = (weights >= lower_bound) & (weights <= upper_bound)
+    return weights * mask * loss_mask
 
 
 def compute_train_infer_is_weights(
@@ -119,10 +119,10 @@ def compute_train_infer_is_weights(
         len(train_log_probs) == len(rollout_log_probs) == len(loss_masks)
     ), f"Input lists must have same length: {len(train_log_probs)} vs {len(rollout_log_probs)} vs {len(loss_masks)}"
 
-    for i, (train, rollout, mask) in enumerate(zip(train_log_probs, rollout_log_probs, loss_masks)):
+    for i, (train, rollout, loss_mask) in enumerate(zip(train_log_probs, rollout_log_probs, loss_masks)):
         assert (
-            train.shape == rollout.shape == mask.shape
-        ), f"Sequence {i}: shapes must match - train: {train.shape}, rollout: {rollout.shape}, mask: {mask.shape}"
+            train.shape == rollout.shape == loss_mask.shape
+        ), f"Sequence {i}: shapes must match - train: {train.shape}, rollout: {rollout.shape}, loss_mask: {loss_mask.shape}"
 
     # TODO: Get device from first tensor and apply to tensors
     # device = train_log_probs[0].device
@@ -162,12 +162,12 @@ def compute_train_infer_is_weights(
         mode: how to handle the importance sampling weights exceeding the thresholds.
         - "truncated": cap the importance sampling weights at the upper threshold
           https://fengyao.notion.site/off-policy-rl#279721e3f6c48092bbe2fcfe0e9c6b33
-        - "clip_mask": zero the importance sampling weights outside the [lower, upper] range.
+        - "mask": zero the importance sampling weights outside the [lower, upper] range.
           https://yingru.notion.site/When-Speed-Kills-Stability-Demystifying-RL-Collapse-from-the-Training-Inference-Mismatch-271211a558b7808d8b12d403fd15edda
         - "clip": clip the importance sampling weights to the [lower, upper] range.
         """
-        if args.train_infer_is_mode == "clip_mask":
-            weights = clip_mask(
+        if args.train_infer_is_mode == "mask":
+            weights = mask(
                 weights,
                 loss_mask,
                 metrics,
