@@ -86,8 +86,14 @@ GRPO_ARGS=(
    --entropy-coef 0.00
    --eps-clip 0.2
    --eps-clip-high 0.28
-   --use-tis
-   --tis-level geometric
+)
+
+TIS_ARGS=(
+   --use-train-infer-tis
+   --train-infer-tis-level token
+   --train-infer-tis-mode clip
+   --train-infer-tis-eps-clip 0.2
+   --train-infer-tis-veto-threshold 1e-4
 )
 
 OPTIMIZER_ARGS=(
