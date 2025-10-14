@@ -1,6 +1,8 @@
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
+
+from slime.backends.megatron_utils.cp_utils import all_gather_with_cp, slice_log_prob_with_cp
 
 
 def masked_sum(
@@ -62,6 +64,7 @@ def calculate_veto_mask(
 def truncate(
     weights: torch.Tensor, loss_mask: torch.Tensor, metrics: Dict[str, Any], *, upper_bound: float
 ) -> torch.Tensor:
+    assert upper_bound is not None
     metrics_append(metrics, "truncate_fraction", (weights > upper_bound).int())
     return weights.clamp(0, upper_bound) * loss_mask
 
@@ -69,6 +72,7 @@ def truncate(
 def clip(
     weights: torch.Tensor, loss_mask: torch.Tensor, metrics: Dict[str, Any], *, lower_bound: float, upper_bound: float
 ) -> torch.Tensor:
+    assert lower_bound is not None and upper_bound is not None and lower_bound < upper_bound
     metrics_append(metrics, "clip_fraction_low", (weights < lower_bound).int())
     metrics_append(metrics, "clip_fraction_high", (weights > upper_bound).int())
     return weights.clamp(lower_bound, upper_bound) * loss_mask
@@ -77,6 +81,7 @@ def clip(
 def mask(
     weights: torch.Tensor, loss_mask: torch.Tensor, metrics: Dict[str, Any], *, lower_bound: float, upper_bound: float
 ) -> torch.Tensor:
+    assert lower_bound is not None and upper_bound is not None and lower_bound < upper_bound
     metrics_append(metrics, "mask_fraction_low", (weights < lower_bound).int())
     metrics_append(metrics, "mask_fraction_high", (weights > upper_bound).int())
     mask = (weights >= lower_bound) & (weights <= upper_bound)
@@ -89,14 +94,13 @@ def compute_train_infer_is_weights(
     train_log_probs: list[torch.Tensor],
     rollout_log_probs: list[torch.Tensor],
     loss_masks: list[torch.Tensor],
-    is_function: Callable[[torch.Tensor, torch.Tensor, Dict[str, Any]], torch.Tensor],
 ) -> Tuple[list[torch.Tensor], Dict[str, Any]]:
     """
     Compute the truncated importance sampling (TIS) weights and metrics.
     Args:
-        train_log_probs: List of log probs from training backend, one tensor per sequence.
-        rollout_log_probs: List of log probs from inference backend, one tensor per sequence.
-        loss_masks: List of loss masks, one tensor per sequence.
+        train_log_probs: List of log probs from training backend.
+        rollout_log_probs: List of log probs from inference backend.
+        loss_masks: List of loss masks.
             Note that for single turn RL, the loss_mask is [1] * response_length for each sequence
             For multi turn RL, the tool response will be marked as 0 in the loss_mask.
 
@@ -196,3 +200,62 @@ def compute_train_infer_is_weights(
         all_weights.append(weights)
 
     return all_weights, metrics
+
+
+def compute_train_infer_is_weights_with_cp(
+    args,
+    *,
+    train_log_probs: list[torch.Tensor],
+    rollout_log_probs: list[torch.Tensor],
+    loss_masks: list[torch.Tensor],
+    total_lengths: list[int],
+    response_lengths: list[int],
+) -> Tuple[list[torch.Tensor], Dict[str, Any]]:
+    """
+    Compute the truncated importance sampling (TIS) weights and metrics with context parallel.
+    Args:
+        train_log_probs: List of log probs from training backend on this cp rank.
+        rollout_log_probs: List of log probs from inference backend on this cp rank.
+        loss_masks: List of loss masks.
+        total_lengths: List of total lengths.
+        response_lengths: List of response lengths.
+    Returns:
+        is_weights: The importance sampling weights. [batch_size, seq_len]
+        is_metrics: The metrics for the importance sampling weights.
+    """
+    # Gather cp slice from other cp ranks
+    full_rollout_log_probs = [
+        all_gather_with_cp(log_prob, total_length, response_length)
+        for log_prob, total_length, response_length in zip(rollout_log_probs, total_lengths, response_lengths)
+    ]
+    full_old_log_probs = [
+        all_gather_with_cp(old_log_prob, total_length, response_length)
+        for old_log_prob, total_length, response_length in zip(train_log_probs, total_lengths, response_lengths)
+    ]
+
+    # Main logic for is
+    is_weights, is_metrics = compute_train_infer_is_weights(
+        args=args,
+        train_log_probs=full_old_log_probs,
+        rollout_log_probs=full_rollout_log_probs,
+        loss_masks=loss_masks,
+    )
+
+    # Slice cp slice and concat to the full response tensor
+    def slice_cp_and_concat(
+        values: list[torch.Tensor], total_lengths: list[int], response_lengths: list[int]
+    ) -> list[torch.Tensor]:
+        # reshape value to the sequence size of the cp rank.
+        values = [
+            # TODO: A rename of this function ?
+            slice_log_prob_with_cp(values[i], total_lengths[i], response_lengths[i])
+            for i in range(len(values))
+        ]
+        return torch.cat(values, dim=0)
+
+    is_weights = slice_cp_and_concat(is_weights, total_lengths, response_lengths)
+    for key, values in is_metrics.items():
+        values = slice_cp_and_concat(values, total_lengths, response_lengths)
+        is_metrics[key] = values
+
+    return is_weights, is_metrics

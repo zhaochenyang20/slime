@@ -14,9 +14,9 @@ from slime.utils.ppo_utils import (
     get_reinforce_plus_plus_baseline_advantages,
     get_reinforce_plus_plus_returns,
 )
-from slime.utils.tis import compute_train_infer_is_weights
+from slime.utils.tis import compute_train_infer_is_weights_with_cp
 
-from .cp_utils import all_gather_with_cp, get_logits_and_tokens_offset_with_cp, get_sum_of_sample_mean, scatter_with_cp
+from .cp_utils import all_gather_with_cp, get_logits_and_tokens_offset_with_cp, get_sum_of_sample_mean
 
 
 def get_responses(
@@ -312,33 +312,14 @@ def policy_loss_function(args, batch, logits, sum_of_sample_mean):
         rollout_log_probs = batch["rollout_log_probs"]
         old_log_probs = batch["log_probs"]
 
-        full_rollout_log_probs = [
-            all_gather_with_cp(log_prob, total_length, response_length)
-            for log_prob, total_length, response_length in zip(rollout_log_probs, total_lengths, response_lengths)
-        ]
-        full_old_log_probs = [
-            all_gather_with_cp(old_log_prob, total_length, response_length)
-            for old_log_prob, total_length, response_length in zip(old_log_probs, total_lengths, response_lengths)
-        ]
-
-        is_weights, is_metrics = compute_train_infer_is_weights(
+        is_weights, is_metrics = compute_train_infer_is_weights_with_cp(
             args=args,
-            train_log_probs=full_old_log_probs,
-            rollout_log_probs=full_rollout_log_probs,
+            train_log_probs=old_log_probs,
+            rollout_log_probs=rollout_log_probs,
             loss_masks=batch["loss_masks"],
+            total_lengths=total_lengths,
+            response_lengths=response_lengths,
         )
-
-        def scatter_cp_and_concat(
-            values: list[torch.Tensor], total_lengths: list[int], response_lengths: list[int]
-        ) -> list[torch.Tensor]:
-            # reshape value to the sequence size of the cp rank.
-            values = [scatter_with_cp(values[i], total_lengths[i], response_lengths[i]) for i in range(len(values))]
-            return torch.cat(values, dim=0)
-
-        is_weights = scatter_cp_and_concat(is_weights, total_lengths, response_lengths)
-        for key, values in is_metrics.items():
-            values = scatter_cp_and_concat(values, total_lengths, response_lengths)
-            is_metrics[key] = values
 
         ois = (-ppo_kl).exp()
         pg_loss = pg_loss * is_weights
