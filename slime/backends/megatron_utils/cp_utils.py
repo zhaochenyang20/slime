@@ -155,32 +155,6 @@ def all_gather_with_cp(tensor: torch.Tensor, total_length: int, response_length:
     return full_tensor
 
 
-def scatter_with_cp(full_tensor: torch.Tensor, total_length: int, response_length: int) -> torch.Tensor:
-    """
-    Inverse of `all_gather_with_cp`. Slice the full tensor and return the corresponding chunk on each CP rank.
-    """
-    cp_size = mpu.get_context_parallel_world_size()
-    if cp_size == 1:
-        return full_tensor
-
-    prompt_length = total_length - response_length
-    _, _, logits_offset, _ = get_logits_and_tokens_offset_with_cp(total_length, response_length)
-
-    def _slice(offset: tuple[int, int]) -> torch.Tensor:
-        start, end = offset
-        if start >= end:
-            return full_tensor.new_empty((0,) + full_tensor.shape[1:])
-        start -= prompt_length - 1
-        end -= prompt_length - 1
-        if start >= end:
-            return full_tensor.new_empty((0,) + full_tensor.shape[1:])
-        return full_tensor[start:end]
-
-    chunk_0 = _slice(logits_offset[0])
-    chunk_1 = _slice(logits_offset[1])
-    return torch.cat([chunk_0, chunk_1], dim=0)
-
-
 def slice_with_cp(tokens: torch.Tensor, pad_value):
     cp_rank = mpu.get_context_parallel_rank()
     cp_size = mpu.get_context_parallel_world_size()

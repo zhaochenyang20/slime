@@ -1151,8 +1151,8 @@ def slime_validate_args(args):
     if args.eps_clip_high is None:
         args.eps_clip_high = args.eps_clip
 
-    if args.train_infer_is_eps_clip_high is None:
-        args.train_infer_is_eps_clip_high = args.train_infer_is_eps_clip
+    if args.train_infer_is_lower_bound is None:
+        args.train_infer_is_lower_bound = args.train_infer_is_upper_bound
 
     if args.eval_reward_key is None:
         args.eval_reward_key = args.reward_key
