@@ -47,9 +47,7 @@ def calculate_veto_mask(
         return torch.ones_like(log_ratio_for_metrics)
     log_veto_threshold = torch.log(torch.tensor(veto_threshold, device=log_ratio_for_metrics.device))
     # For each sequence, if it has any catastrophic tokens, return 0 for the sequence
-    catastrophic_tokens = (
-        (log_ratio_for_metrics < log_veto_threshold) | (log_ratio_for_metrics > -log_veto_threshold)
-    ) & loss_mask.bool()
+    catastrophic_tokens = ((log_ratio_for_metrics < log_veto_threshold)) & loss_mask.bool()
     has_catastrophic = catastrophic_tokens.any()
     veto_mask = (~has_catastrophic).float().expand_as(log_ratio_for_metrics)
 
@@ -61,25 +59,27 @@ def calculate_veto_mask(
     return veto_mask
 
 
-def truncate(weights: torch.Tensor, loss_mask: torch.Tensor, metrics: Dict[str, Any], *, eps: float) -> torch.Tensor:
-    metrics_append(metrics, "truncate_fraction", (weights > eps).int())
-    return weights.clamp(0, eps) * loss_mask
+def truncate(
+    weights: torch.Tensor, loss_mask: torch.Tensor, metrics: Dict[str, Any], *, upper_bound: float
+) -> torch.Tensor:
+    metrics_append(metrics, "truncate_fraction", (weights > upper_bound).int())
+    return weights.clamp(0, upper_bound) * loss_mask
 
 
 def clip(
-    weights: torch.Tensor, loss_mask: torch.Tensor, metrics: Dict[str, Any], *, eps_clip: float, eps_clip_high: float
+    weights: torch.Tensor, loss_mask: torch.Tensor, metrics: Dict[str, Any], *, lower_bound: float, upper_bound: float
 ) -> torch.Tensor:
-    metrics_append(metrics, "clip_fraction_low", (weights < 1 - eps_clip).int())
-    metrics_append(metrics, "clip_fraction_high", (weights > 1 + eps_clip_high).int())
-    return weights.clamp(1 - eps_clip, 1 + eps_clip_high) * loss_mask
+    metrics_append(metrics, "clip_fraction_low", (weights < lower_bound).int())
+    metrics_append(metrics, "clip_fraction_high", (weights > upper_bound).int())
+    return weights.clamp(lower_bound, upper_bound) * loss_mask
 
 
 def clip_mask(
-    weights: torch.Tensor, loss_mask: torch.Tensor, metrics: Dict[str, Any], *, eps_clip: float, eps_clip_high: float
+    weights: torch.Tensor, loss_mask: torch.Tensor, metrics: Dict[str, Any], *, lower_bound: float, upper_bound: float
 ) -> torch.Tensor:
-    metrics_append(metrics, "clip_fraction_low", (weights < 1 - eps_clip).int())
-    metrics_append(metrics, "clip_fraction_high", (weights > 1 + eps_clip_high).int())
-    clip_mask = (weights >= 1 - eps_clip) & (weights <= 1 + eps_clip_high)
+    metrics_append(metrics, "clip_fraction_low", (weights < lower_bound).int())
+    metrics_append(metrics, "clip_fraction_high", (weights > upper_bound).int())
+    clip_mask = (weights >= lower_bound) & (weights <= upper_bound)
     return weights * clip_mask * loss_mask
 
 
@@ -157,7 +157,36 @@ def compute_train_infer_is_weights(
             )
 
         metrics_append(metrics, "raw_ratio_mean", weights)
-        weights = is_function(weights, loss_mask, metrics)
+
+        """    
+        mode: how to handle the importance sampling weights exceeding the thresholds.
+        - "truncated": cap the importance sampling weights at the upper threshold
+          https://fengyao.notion.site/off-policy-rl#279721e3f6c48092bbe2fcfe0e9c6b33
+        - "clip_mask": zero the importance sampling weights outside the [lower, upper] range.
+          https://yingru.notion.site/When-Speed-Kills-Stability-Demystifying-RL-Collapse-from-the-Training-Inference-Mismatch-271211a558b7808d8b12d403fd15edda
+        - "clip": clip the importance sampling weights to the [lower, upper] range.
+        """
+        if args.train_infer_is_mode == "clip_mask":
+            weights = clip_mask(
+                weights,
+                loss_mask,
+                metrics,
+                lower_bound=args.train_infer_is_lower_bound,
+                upper_bound=args.train_infer_is_upper_bound,
+            )
+        elif args.train_infer_is_mode == "clip":
+            weights = clip(
+                weights,
+                loss_mask,
+                metrics,
+                lower_bound=args.train_infer_is_lower_bound,
+                upper_bound=args.train_infer_is_upper_bound,
+            )
+        elif args.train_infer_is_mode == "truncate":
+            weights = truncate(weights, loss_mask, metrics, upper_bound=args.train_infer_is_upper_bound)
+        else:
+            raise ValueError(f"Unsupported train_infer_is_mode: {args.train_infer_is_mode}")
+
         metrics_append(metrics, "ratio_mean_after_tis", weights)
         if args.train_infer_is_veto_threshold is not None:
             weights = weights * veto_mask

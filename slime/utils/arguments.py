@@ -49,30 +49,34 @@ def add_is_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--train-infer-is-mode",
         type=str,
-        choices=["truncate", "clip"],
+        choices=["truncate", "clip_mask", "clip"],
         default="truncate",
         help=(
-            "Handling mode for IS weights: truncate (cap upper bound, TIS) or clip "
-            "(zero outside [lower, upper], CIS)."
+            "Handling mode for IS weights:"
+            "truncate (cap upper bound, TIS),"
+            "clip_mask (zero outside [lower, upper], CIS),"
+            "clip (clip to [lower, upper], CIS)."
         ),
     )
     parser.add_argument(
-        "--train-infer-is-eps-clip",
+        "--train-infer-is-lower-bound",
         type=float,
-        default=0.2,
-        help=("Lower clip threshold for IS weights. Default is 0.2. "),
+        default=0.5,
+        help=(
+            "For clip or clip_mask mode, the lower bound of the IS weights. For truncate mode, it will not be used."
+        ),
     )
     parser.add_argument(
-        "--train-infer-is-eps-clip-high",
+        "--train-infer-is-upper-bound",
         type=float,
-        default=None,
-        help=("Upper clip threshold for IS weights. Default is None. Truncate mode will not use this value."),
+        default=2.0,
+        help=("For truncate, clip, and clip_mask mode, the upper bound of the IS weights."),
     )
     parser.add_argument(
         "--train-infer-is-veto-threshold",
         type=float,
-        default=None,
-        help=("Per-token veto threshold. If any token ratio < this or > 1/this, zero the entire sequence weight."),
+        default=1e-4,
+        help=("Per-token veto threshold. If any token ratio < this, zero the entire sequence weight."),
     )
 
     return parser

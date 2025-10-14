@@ -157,7 +157,7 @@ def all_gather_with_cp(tensor: torch.Tensor, total_length: int, response_length:
 
 def scatter_with_cp(full_tensor: torch.Tensor, total_length: int, response_length: int) -> torch.Tensor:
     """
-    Inverse of `all_gather_with_cp`. Returns the chunk for the current CP rank.
+    Inverse of `all_gather_with_cp`. Slice the full tensor and return the corresponding chunk on each CP rank.
     """
     cp_size = mpu.get_context_parallel_world_size()
     if cp_size == 1:
