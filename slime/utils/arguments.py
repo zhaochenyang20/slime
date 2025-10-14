@@ -32,10 +32,11 @@ def add_is_arguments(parser: argparse.ArgumentParser):
         "--use-train-infer-is",
         action="store_true",
         default=False,
-        help="Enable importance sampling, details refer to the comments of compute_train_infer_is_weights in train_infer_is.py",
+        help=(
+            "Enable importance sampling, details refer to the comments of compute_train_infer_is_weights "
+            "in train_infer_is.py"
+        ),
     )
-
-    # Extended TIS controls (levels/modes/thresholds) with backward compatibility
     parser.add_argument(
         "--train-infer-is-level",
         type=str,
@@ -61,8 +62,11 @@ def add_is_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--train-infer-is-lower-bound",
         type=float,
-        default=0.5,
-        help=("For mask or clip mode, the lower bound of the IS weights. For truncate mode, it will not be used."),
+        default=None,
+        help=(
+            "For mask or clip mode, the lower bound of the IS weights. For truncate mode, it will not be used. "
+            "If not set, it will be set to 1.0 / train_infer_is_upper_bound."
+        ),
     )
     parser.add_argument(
         "--train-infer-is-upper-bound",
@@ -73,7 +77,7 @@ def add_is_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--train-infer-is-veto-threshold",
         type=float,
-        default=1e-4,
+        default=None,
         help=(
             "Per-token veto threshold. If any token ratio < this, zero the entire sequence weight, the sequences won't have gradient."
         ),
@@ -1153,8 +1157,9 @@ def slime_validate_args(args):
     if args.eps_clip_high is None:
         args.eps_clip_high = args.eps_clip
 
-    if args.train_infer_is_lower_bound is None:
-        args.train_infer_is_lower_bound = args.train_infer_is_upper_bound
+    if args.use_train_infer_is:
+        if args.train_infer_is_lower_bound is None:
+            args.train_infer_is_lower_bound = 1.0 / args.train_infer_is_upper_bound
 
     if args.eval_reward_key is None:
         args.eval_reward_key = args.reward_key

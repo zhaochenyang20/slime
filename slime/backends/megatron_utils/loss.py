@@ -14,7 +14,7 @@ from slime.utils.ppo_utils import (
     get_reinforce_plus_plus_baseline_advantages,
     get_reinforce_plus_plus_returns,
 )
-from slime.utils.tis import compute_train_infer_is_weights_with_cp
+from slime.utils.train_infer_is import compute_train_infer_is_weights_with_cp
 
 from .cp_utils import all_gather_with_cp, get_logits_and_tokens_offset_with_cp, get_sum_of_sample_mean
 
