@@ -32,7 +32,7 @@ def add_is_arguments(parser: argparse.ArgumentParser):
         "--use-train-infer-is",
         action="store_true",
         default=False,
-        help="Enable TIS from https://fengyao.notion.site/off-policy-rl for off-policy importance sampling.",
+        help="Enable importance sampling, details refer to the comments of compute_train_infer_is_weights in train_infer_is.py",
     )
 
     # Extended TIS controls (levels/modes/thresholds) with backward compatibility
@@ -54,7 +54,7 @@ def add_is_arguments(parser: argparse.ArgumentParser):
         help=(
             "Handling mode for IS weights:"
             "truncate (cap upper bound, TIS),"
-            "mask (zero outside [lower, upper], CIS),"
+            "mask (zero outside [lower, upper], MIS),"
             "clip (clip to [lower, upper], CIS)."
         ),
     )
@@ -62,19 +62,21 @@ def add_is_arguments(parser: argparse.ArgumentParser):
         "--train-infer-is-lower-bound",
         type=float,
         default=0.5,
-        help=("For clip or mask mode, the lower bound of the IS weights. For truncate mode, it will not be used."),
+        help=("For mask or clip mode, the lower bound of the IS weights. For truncate mode, it will not be used."),
     )
     parser.add_argument(
         "--train-infer-is-upper-bound",
         type=float,
         default=2.0,
-        help=("For truncate, clip, and mask mode, the upper bound of the IS weights."),
+        help=("For truncate, mask, or clip mode, the upper bound of the IS weights."),
     )
     parser.add_argument(
         "--train-infer-is-veto-threshold",
         type=float,
         default=1e-4,
-        help=("Per-token veto threshold. If any token ratio < this, zero the entire sequence weight."),
+        help=(
+            "Per-token veto threshold. If any token ratio < this, zero the entire sequence weight, the sequences won't have gradient."
+        ),
     )
 
     return parser

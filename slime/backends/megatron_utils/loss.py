@@ -309,13 +309,10 @@ def policy_loss_function(args, batch, logits, sum_of_sample_mean):
     if args.use_train_infer_is:
         assert "rollout_log_probs" in batch, "rollout_log_probs must be provided for TIS"
 
-        rollout_log_probs = batch["rollout_log_probs"]
-        old_log_probs = batch["log_probs"]
-
         is_weights, is_metrics = compute_train_infer_is_weights_with_cp(
             args=args,
-            train_log_probs=old_log_probs,
-            rollout_log_probs=rollout_log_probs,
+            train_log_probs=batch["log_probs"],
+            rollout_log_probs=batch["rollout_log_probs"],
             loss_masks=batch["loss_masks"],
             total_lengths=total_lengths,
             response_lengths=response_lengths,
