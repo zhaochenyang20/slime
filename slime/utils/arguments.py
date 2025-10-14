@@ -59,22 +59,19 @@ def add_tis_arguments(parser: argparse.ArgumentParser):
         "--train-infer-tis-eps-clip",
         type=float,
         default=0.2,
-        help=(
-            "Lower clip threshold for IS weights. Default is 0.2. "
-            "For clip mode uses this value; for truncate mode remains unused."
-        ),
+        help=("Lower clip threshold for IS weights. Default is 0.2. "),
     )
     parser.add_argument(
         "--train-infer-tis-eps-clip-high",
         type=float,
         default=None,
-        help=("Upper clip threshold for IS weights. Default is None."),
+        help=("Upper clip threshold for IS weights. Default is None. Truncate mode will not use this value."),
     )
     parser.add_argument(
         "--train-infer-tis-veto-threshold",
         type=float,
         default=None,
-        help=("Per-token veto threshold. If any token ratio < this, zero the entire sequence weight."),
+        help=("Per-token veto threshold. If any token ratio < this or > 1/this, zero the entire sequence weight."),
     )
 
     return parser

@@ -17,7 +17,7 @@ from slime.utils.ppo_utils import (
 )
 from slime.utils.tis import clip, clip_to_zero, compute_train_infer_tis_weights, truncate
 
-from .cp_utils import all_gather_with_cp, get_logits_and_tokens_offset_with_cp, get_sum_of_sample_mean
+from .cp_utils import all_gather_with_cp, get_logits_and_tokens_offset_with_cp, get_sum_of_sample_mean, scatter_with_cp
 
 
 def get_responses(
@@ -356,10 +356,20 @@ def policy_loss_function(args, batch, logits, sum_of_sample_mean):
             train_log_probs=full_old_log_probs,
             rollout_log_probs=full_rollout_log_probs,
             loss_masks=batch["loss_masks"],
-            total_lengths=total_lengths,
-            response_lengths=response_lengths,
             tis_function=tis_function,
         )
+
+        def scatter_cp_and_concat(
+            values: list[torch.Tensor], total_lengths: list[int], response_lengths: list[int]
+        ) -> list[torch.Tensor]:
+            # reshape value to the sequence size of the cp rank.
+            values = [scatter_with_cp(values[i], total_lengths[i], response_lengths[i]) for i in range(len(values))]
+            return torch.cat(values, dim=0)
+
+        tis_weights = scatter_cp_and_concat(tis_weights, total_lengths, response_lengths)
+        for key, values in tis_metrics.items():
+            values = scatter_cp_and_concat(values, total_lengths, response_lengths)
+            tis_metrics[key] = values
 
         ois = (-ppo_kl).exp()
         pg_loss = pg_loss * tis_weights
@@ -407,7 +417,7 @@ def policy_loss_function(args, batch, logits, sum_of_sample_mean):
         reported_loss["ois"] = sum_of_sample_mean(ois).clone().detach()
         for metric_key, metric_value in tis_metrics.items():
             key_name = f"train_infer_{metric_key}"
-            reported_loss[key_name] = sum_of_sample_mean(metric_value).clone().detach()
+            reported_loss[key_name] = sum_of_sample_mean(metric_value)
 
     return loss, reported_loss
 

@@ -1,7 +1,6 @@
 from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
-from slime.backends.megatron_utils.cp_utils import scatter_with_cp
 
 
 def masked_sum(
@@ -22,23 +21,20 @@ def masked_mean(
     return total / (denom + eps)
 
 
-def metrics_add(metrics: Dict[str, Any], key: str, value: float) -> None:
-    if key not in metrics:
-        metrics[key] = 0
-    metrics[key] += value
+def metrics_append(metrics: Dict[str, list[torch.Tensor]], key: str, value: torch.Tensor) -> None:
+    """
+    Any metric should be list[torch.Tensor] with size [num_seq, response_length]
+    All tis metrics will be aggregated and averaged by `sum_of_sample_mean` and megatron automatically
+    The result will be sequence-level average or token-level if `calculate_per_token_loss` is set.
+    You have no need to worry about loss_mask — the sum_of_sample_mean automatically ignores statistics where loss_mask = 0.
 
-
-def metrics_append(metrics: Dict[str, Any], key: str, value: torch.Tensor) -> None:
+    e.g.
+    To calculate a token-level metric like the ratio of catastrophic tokens, just append the orignal ratio tensor to the metrics dict.
+    To calculate a sequence-level metric like the ratio of vetoed sequences, you should set every value in the tensor to be 0 or 1.
+    """
     if key not in metrics:
         metrics[key] = []
     metrics[key].append(value.clone().detach())
-
-
-def scatter_cp_and_concat(
-    values: list[torch.Tensor], total_lengths: list[int], response_lengths: list[int]
-) -> list[torch.Tensor]:
-    values = [scatter_with_cp(values[i], total_lengths[i], response_lengths[i]) for i in range(len(values))]
-    return torch.cat(values, dim=0)
 
 
 def calculate_veto_mask(
@@ -57,7 +53,11 @@ def calculate_veto_mask(
     has_catastrophic = catastrophic_tokens.any()
     veto_mask = (~has_catastrophic).float().expand_as(log_ratio_for_metrics)
 
-    metrics_append(metrics, "catastrophic_fraction", has_catastrophic.int().expand_as(loss_mask))
+    # TODO(jiajun): A single catastrophic token may not be enough to veto the entire sequence?
+    # May be we can set a threshold for the ratio of catastrophic tokens?
+    # If exceeds, veto the entire sequence. If not, only mask the catastrophic tokens.
+    metrics_append(metrics, "catastrophic_token_fraction", catastrophic_tokens.int())
+    metrics_append(metrics, "catastrophic_seq_fraction", has_catastrophic.int().expand_as(loss_mask))
     return veto_mask
 
 
@@ -89,25 +89,16 @@ def compute_train_infer_tis_weights(
     train_log_probs: list[torch.Tensor],
     rollout_log_probs: list[torch.Tensor],
     loss_masks: list[torch.Tensor],
-    total_lengths: Optional[list[int]] = None,
-    response_lengths: Optional[list[int]] = None,
     tis_function: Callable[[torch.Tensor, torch.Tensor, Dict[str, Any]], torch.Tensor],
 ) -> Tuple[list[torch.Tensor], Dict[str, Any]]:
     """
     Compute the truncated importance sampling (TIS) weights and metrics.
-
-    Adapted from:
-
-    https://fengyao.notion.site/off-policy-rl#279721e3f6c48092bbe2fcfe0e9c6b33
-    https://yingru.notion.site/When-Speed-Kills-Stability-Demystifying-RL-Collapse-from-the-Training-Inference-Mismatch-271211a558b7808d8b12d403fd15edda
-
     Args:
         train_log_probs: List of log probs from training backend, one tensor per sequence.
         rollout_log_probs: List of log probs from inference backend, one tensor per sequence.
         loss_masks: List of loss masks, one tensor per sequence.
             Note that for single turn RL, the loss_mask is [1] * response_length for each sequence
             For multi turn RL, the tool response will be marked as 0 in the loss_mask.
-        response_lengths: The length of the response for each sequence.
 
     Returns:
         weights: The importance sampling weights. [batch_size, seq_len]
@@ -127,12 +118,6 @@ def compute_train_infer_tis_weights(
     assert (
         len(train_log_probs) == len(rollout_log_probs) == len(loss_masks)
     ), f"Input lists must have same length: {len(train_log_probs)} vs {len(rollout_log_probs)} vs {len(loss_masks)}"
-
-    if total_lengths is not None:
-        assert response_lengths is not None, "response_lengths must be provided when total_lengths is set"
-        assert len(total_lengths) == len(
-            train_log_probs
-        ), f"total_lengths must match number of sequences, got {len(total_lengths)} vs {len(train_log_probs)}"
 
     for i, (train, rollout, mask) in enumerate(zip(train_log_probs, rollout_log_probs, loss_masks)):
         assert (
@@ -180,10 +165,5 @@ def compute_train_infer_tis_weights(
 
         weights = weights.detach()
         all_weights.append(weights)
-
-    all_weights = scatter_cp_and_concat(all_weights, total_lengths, response_lengths)
-    for key, values in metrics.items():
-        values = scatter_cp_and_concat(values, total_lengths, response_lengths)
-        metrics[key] = values
 
     return all_weights, metrics
