@@ -31,9 +31,9 @@ CKPT_ARGS=(
    --hf-checkpoint /root/Qwen3-30B-A3B
    #--hf-checkpoint /root/Qwen3-30B-A3B-FP8
    --ref-load /root/Qwen3-30B-A3B_torch_dist
-   --load /root/Qwen3-30B-A3B_slime/
-   --save /root/Qwen3-30B-A3B_slime/
-   --save-interval 1000
+   # --load /root/Qwen3-30B-A3B_slime/
+   # --save /root/Qwen3-30B-A3B_slime/
+   # --save-interval 20
 )
 
 ROLLOUT_ARGS=(
@@ -55,17 +55,17 @@ ROLLOUT_ARGS=(
 
 EVAL_ARGS=(
    # --eval-interval 20
-   # --eval-prompt-data aime /root/aime-2024/aime-2024.jsonl
-   # --n-samples-per-eval-prompt 16
-   # --eval-max-response-len 16384
-   # --eval-top-p 0.7
+   --eval-prompt-data aime /root/aime-2024/aime-2024.jsonl
+   --n-samples-per-eval-prompt 16
+   --eval-max-response-len 16384
+   --eval-top-p 0.7
 )
 
 PERF_ARGS=(
    --tensor-model-parallel-size 2
    --sequence-parallel
    --pipeline-model-parallel-size 1
-   --context-parallel-size 1
+   --context-parallel-size 2
    --expert-model-parallel-size 4
    --expert-tensor-parallel-size 1
 
@@ -111,10 +111,11 @@ OPTIMIZER_ARGS=(
 )
 
 WANDB_ARGS=(
-   #--use-wandb
-   # --wandb-project slime-dev
-   # --wandb-group qwen3-30B-A3B-test
-   # --wandb-key ${WANDB_KEY}
+   --use-wandb
+   --wandb-project slime-dev
+   --wandb-group qwen3-30B-A3B-TIS
+   --wandb-run-id qwen3-30B-A3B-TIS-sequence
+   --wandb-key ${WANDB_KEY}
 )
 
 SGLANG_ARGS=(
