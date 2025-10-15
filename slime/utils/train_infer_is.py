@@ -150,28 +150,28 @@ def compute_train_infer_is_weights(
     for train_log_prob, rollout_log_prob, loss_mask in zip(train_log_probs, rollout_log_probs, loss_masks):
         loss_mask = loss_mask.float()
         add_ppl_metrics(train_log_prob, rollout_log_prob, loss_mask, metrics)
-        raw_log_ratio = train_log_prob - rollout_log_prob
+        raw_log_ratio_diff = train_log_prob - rollout_log_prob
 
         # level: The aggregation level for the importance sampling weights.
         if level == "token":
             # Per-token ratio (biased)
-            log_ratio_for_metrics = raw_log_ratio
+            log_ratio_for_metrics = raw_log_ratio_diff
         elif level == "sequence":
             # Product of ratios (unbiased but high variance)
-            log_ratio_for_metrics = masked_sum(raw_log_ratio, loss_mask, expand=True)
+            log_ratio_for_metrics = masked_sum(raw_log_ratio_diff, loss_mask, expand=True)
         elif level == "geometric":
             # Geometric mean of ratios (biased but low variance)
-            log_ratio_for_metrics = masked_mean(raw_log_ratio, loss_mask, expand=True)
+            log_ratio_for_metrics = masked_mean(raw_log_ratio_diff, loss_mask, expand=True)
         else:
             raise ValueError(f"Invalid importance sampling level: {level}")
 
         log_ratio_safe = torch.clamp(log_ratio_for_metrics, min=-SAFETY_BOUND, max=SAFETY_BOUND)
         weights = torch.exp(log_ratio_safe)
-        metrics_append(metrics, "ratio_mean_before_tis", weights)
+        metrics_append(metrics, "mean_is_weight_before_clip", weights)
 
         # mask out catastrophic tokens
         if args.train_infer_is_veto_threshold is not None:
-            veto_mask = calculate_veto_mask(raw_log_ratio, loss_mask, args.train_infer_is_veto_threshold, metrics)
+            veto_mask = calculate_veto_mask(raw_log_ratio_diff, loss_mask, args.train_infer_is_veto_threshold, metrics)
 
         # mode: how to handle the importance sampling weights exceeding the thresholds.
         if args.train_infer_is_mode == "truncate":
