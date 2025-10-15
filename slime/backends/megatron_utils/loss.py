@@ -14,14 +14,9 @@ from slime.utils.ppo_utils import (
     get_reinforce_plus_plus_baseline_advantages,
     get_reinforce_plus_plus_returns,
 )
-from slime.utils.tis import compute_tis_weights
+from slime.utils.train_infer_is import compute_train_infer_is_weights_with_cp
 
-from .cp_utils import (
-    all_gather_with_cp,
-    get_logits_and_tokens_offset_with_cp,
-    get_sum_of_sample_mean,
-    slice_log_prob_with_cp,
-)
+from .cp_utils import all_gather_with_cp, get_logits_and_tokens_offset_with_cp, get_sum_of_sample_mean
 
 
 def get_responses(
@@ -311,56 +306,20 @@ def policy_loss_function(args, batch, logits, sum_of_sample_mean):
     pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, args.eps_clip, args.eps_clip_high)
 
     # Apply TIS off-policy correction using importance sampling if enabled
-    if args.use_tis:
+    if args.use_train_infer_is:
         assert "rollout_log_probs" in batch, "rollout_log_probs must be provided for TIS"
 
-        rollout_log_probs = batch["rollout_log_probs"]
-        old_log_probs = batch["log_probs"]
-
-        full_rollout_log_probs = [
-            all_gather_with_cp(log_prob, total_length, response_length)
-            for log_prob, total_length, response_length in zip(rollout_log_probs, total_lengths, response_lengths)
-        ]
-        full_old_log_probs = [
-            all_gather_with_cp(old_log_prob, total_length, response_length)
-            for old_log_prob, total_length, response_length in zip(old_log_probs, total_lengths, response_lengths)
-        ]
-
-        # old_log_probs, log_probs, loss_masks are all concated into 1D tensor
-        full_old_log_probs_flat = torch.cat(full_old_log_probs, dim=0)
-        full_rollout_log_probs = torch.cat(full_rollout_log_probs, dim=0)
-        # loss_mask is not sliced by cp, so no need to all_gather
-        full_loss_masks_flat = torch.cat(batch["loss_masks"], dim=0)
-
-        tis_weights, tis_metrics = compute_tis_weights(
-            old_log_prob_flat=full_old_log_probs_flat,
-            rollout_log_prob_flat=full_rollout_log_probs,
-            loss_mask_flat=full_loss_masks_flat,
-            level=getattr(args, "tis_level", "token"),
-            mode=getattr(args, "tis_mode", "truncate"),
-            upper_threshold=getattr(args, "tis_threshold_upper", 2.0),
-            lower_threshold=getattr(args, "tis_threshold_lower", 1.0 / getattr(args, "tis_threshold_upper", 2.0)),
-            veto_threshold=getattr(args, "tis_veto_threshold", 1e-4),
-            safety_bound=getattr(args, "tis_safety_bound", 20.0),
-            response_lengths=response_lengths,
+        is_weights, is_metrics = compute_train_infer_is_weights_with_cp(
+            args=args,
+            train_log_probs=batch["log_probs"],
+            rollout_log_probs=batch["rollout_log_probs"],
+            loss_masks=batch["loss_masks"],
             total_lengths=total_lengths,
+            response_lengths=response_lengths,
         )
 
         ois = (-ppo_kl).exp()
-
-        # tis_weights is a 1D tensor, should be sliced to the local cp rank
-        local_tis_chunks = []
-        start = 0
-        for total_len, response_len in zip(total_lengths, response_lengths):
-            end = start + int(response_len)
-            seq_weights = tis_weights[start:end]
-            # Slice to the two local chunks of this CP rank
-            local_chunk = slice_log_prob_with_cp(seq_weights, int(total_len), int(response_len))
-            local_tis_chunks.append(local_chunk)
-            start = end
-        tis_weights = torch.cat(local_tis_chunks, dim=0)
-
-        pg_loss = pg_loss * tis_weights
+        pg_loss = pg_loss * is_weights
 
     pg_loss = sum_of_sample_mean(pg_loss)
     pg_clipfrac = sum_of_sample_mean(pg_clipfrac)
@@ -400,9 +359,12 @@ def policy_loss_function(args, batch, logits, sum_of_sample_mean):
     if args.use_kl_loss:
         reported_loss["kl_loss"] = kl_loss.clone().detach()
 
-    if args.use_tis:
+    if args.use_train_infer_is:
         # Backward compatible basic logs
         reported_loss["ois"] = sum_of_sample_mean(ois).clone().detach()
+        for metric_key, metric_value in is_metrics.items():
+            key_name = f"train_infer_{metric_key}"
+            reported_loss[key_name] = sum_of_sample_mean(metric_value)
 
     return loss, reported_loss
 
