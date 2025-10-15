@@ -86,8 +86,15 @@ GRPO_ARGS=(
    --entropy-coef 0.00
    --eps-clip 0.2
    --eps-clip-high 0.28
+)
 
-   --use-tis
+IS_ARGS=(
+   --use-train-infer-is
+   --train-infer-is-level geometric
+   --train-infer-is-mode mask
+   --train-infer-is-lower-bound 0.5
+   --train-infer-is-upper-bound 2.0
+   --train-infer-is-veto-threshold 1e-3
 )
 
 OPTIMIZER_ARGS=(
