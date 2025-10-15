@@ -8,7 +8,7 @@ from slime.backends.megatron_utils.cp_utils import all_gather_with_cp, slice_log
 def metrics_append(metrics: Dict[str, list[torch.Tensor]], key: str, value: torch.Tensor) -> None:
     """
 
-    Every metrics-dict value is a list[torch.Tensor] with shapes exactly the same as log_probs.
+    Every metrics-dict value is a list of 1D tensor, i.e., [torch.Tensor] with shapes exactly the same as log_probs.
 
     All metrics will be aggregated and averaged by `sum_of_sample_mean` and divided by DP size automatically
     - If calculate_per_token_loss=False (default), the final results will first be averaged in each sequence,
@@ -29,8 +29,8 @@ def metrics_append(metrics: Dict[str, list[torch.Tensor]], key: str, value: torc
         When calculate_per_token_loss = True:
             result = (0.1 + 0.2 + 0.1 + 0.2 + 0.3 + 0.4 + 0.5 + 0.6) / 8 = 2.4 / 8 = 0.3
     For sequence-level metric:
-        original sequence lengths = [2, 5, 1]
-        We should expand the metrics to the length of each sequence
+        original sequence lengths = [2, 5, 2]
+        We should expand the metrics to the length of each sequence:
         value = [
             [2, 2],
             [5, 5, 5, 5, 5],
@@ -38,9 +38,7 @@ def metrics_append(metrics: Dict[str, list[torch.Tensor]], key: str, value: torc
         ]
         When calculate_per_token_loss = False (default):
             result = (2 + 2) / 2 + (5 + 5 + 5 + 5 + 5) / 5 + (1 + 1) / 2 = 2 + 5 + 1 = 8 / 3 = 2.6665
-        When calculate_per_token_loss = True:
-            result = (2 + 2 + 5 + 5 + 5 + 5 + 5 + 1 + 1) / 8 = 31 / 8 = 3.875 ???
-            This is not what we expect. So, when calculate_per_token_loss = True, sequence-level metrics becomes invalid !!
+        Note that for sequence-level, calculating token-level loss is invalid; thus, calculate_per_token_loss should always be False.
     """
     if key not in metrics:
         metrics[key] = []
@@ -109,13 +107,13 @@ def compute_train_infer_is_weights(
     loss_masks: list[torch.Tensor],
 ) -> Tuple[list[torch.Tensor], Dict[str, list[torch.Tensor]]]:
     """
-    Compute the truncated importance sampling (TIS) weights and metrics.
+    Compute the importance sampling (IS) weights and metrics between the inference and training engine.
     Args:
-        train_log_probs: List of log probs from training backend. 1D tensor each.
+        train_log_probs: List of log probs from training backend. 1D tensor each. Lengths can be different.
         rollout_log_probs: List of log probs from inference backend. 1D tensor each.
         loss_masks: List of loss masks. 1D tensor each.
             Note that for single turn RL, the loss_mask is [1] * response_length tensor for each sequence
-            For multi turn RL, the tool response will be marked as 0 in the loss_mask.
+            For multi-turn RL, the tool response will be marked as 0 in the loss_mask.
 
     Returns:
         weights: List of importance sampling weights. 1D tensor each.
@@ -152,7 +150,7 @@ def compute_train_infer_is_weights(
             agg_log_ratio = (raw_log_ratio * loss_mask).sum()
             log_ratio_for_metrics = agg_log_ratio.expand_as(raw_log_ratio)
         elif level == "geometric":
-            # Geometric mean of ratios (experimental but low variance)
+            # Geometric mean of ratios (biased but low variance)
             agg_log_ratio = (raw_log_ratio * loss_mask).sum() / torch.clamp_min(loss_mask.sum(), 1)
             log_ratio_for_metrics = agg_log_ratio.expand_as(raw_log_ratio)
         else:
@@ -218,7 +216,7 @@ def compute_train_infer_is_weights_with_cp(
     """
     Compute the truncated importance sampling (TIS) weights and metrics with context parallel.
     Args:
-        train_log_probs: List of log probs from training backend on this cp rank. 1D tensor each.
+        train_log_probs: List of log probs from training backend on this cp rank. 1D tensor each. Lengths can be different.
         rollout_log_probs: List of log probs from inference backend on this cp rank. 1D tensor each.
         loss_masks: List of loss masks. 1D tensor each.
         total_lengths: List of total lengths.
@@ -251,7 +249,7 @@ def compute_train_infer_is_weights_with_cp(
         values: list[torch.Tensor], total_lengths: list[int], response_lengths: list[int]
     ) -> torch.Tensor:
         values = [
-            # TODO: A rename of this function ?
+            # TODO: A rename of this function?
             slice_log_prob_with_cp(values[i], total_lengths[i], response_lengths[i])
             for i in range(len(values))
         ]
