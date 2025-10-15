@@ -293,24 +293,32 @@ def add_ppl_metrics(
     metrics_append(metrics, "rollout_log_ppl", rollout_log_ppl)
     metrics_append(metrics, "rollout_ppl", rollout_ppl)
 
-    # 2a. kl: Direct estimator for KL(π_rollout || π_training)
+    # 3a. kl: Direct estimator for KL(π_rollout || π_training)
     # This is the standard KL divergence: E[log(π_rollout) - log(π_training)]
     # Positive value means rollout policy is more confident than training policy
     kl_per_token = rollout_log_prob - train_log_prob
     metrics_append(metrics, "kl", kl_per_token)
 
-    # 2b. K3 KL estimator for improved stability
+    # 3b. K3 KL estimator for improved stability
+    # More stable for small KL values using: E[exp(log_ratio) - log_ratio - 1]
+    # Formula: KL ≈ E[r - log(r) - 1] where r = π_training/π_rollout
     log_ratio = train_log_prob - rollout_log_prob
     k3_kl_matrix = torch.exp(log_ratio) - log_ratio - 1
     metrics_append(metrics, "k3_kl", k3_kl_matrix)
 
-    # 2d. Log perplexity differences and related statistics
+    # 3c. Log PPL difference (sequence-level perplexity difference)
+    # log_ppl_diff = mean_log_prob_rollout - mean_log_prob_training
+    # Since ppl = exp(-log_prob), we have:
+    #   log(ppl_ratio) = log(training_ppl/rollout_ppl) = log_ppl_diff
+    # Positive value means training assigns lower probability (higher PPL) than rollout
     log_ppl_diff = mean_log_prob_rollout - mean_log_prob_training
     metrics_append(metrics, "log_ppl_diff", log_ppl_diff)
     metrics_append(metrics, "log_ppl_abs_diff", log_ppl_diff.abs())
     metrics_append(metrics, "log_ppl_diff_max", log_ppl_diff)
     metrics_append(metrics, "log_ppl_diff_min", log_ppl_diff)
 
-    # 2e. Perplexity ratio between training and rollout policies
+    # 3d. PPL ratio (how much higher is training PPL vs rollout PPL)
+    # For numerical stability, compute in log space using log_ppl_diff
+    # Note: log_ppl_diff = log(ppl_ratio), so ppl_ratio = exp(log_ppl_diff)
     ppl_ratio = torch.exp(log_ppl_diff)
     metrics_append(metrics, "ppl_ratio", ppl_ratio)
