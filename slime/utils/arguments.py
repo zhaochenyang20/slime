@@ -54,7 +54,7 @@ def add_is_arguments(parser: argparse.ArgumentParser):
         default="truncate",
         help=(
             "Handling mode for IS weights:"
-            "truncate (cap upper bound, TIS),"
+            "truncate (cap to upper bound, TIS),"
             "mask (zero outside [lower, upper], MIS),"
             "clip (clip to [lower, upper], CIS)."
         ),

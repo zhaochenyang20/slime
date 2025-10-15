@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 
@@ -8,8 +8,7 @@ from slime.backends.megatron_utils.cp_utils import all_gather_with_cp, slice_log
 def metrics_append(metrics: Dict[str, list[torch.Tensor]], key: str, value: torch.Tensor) -> None:
     """
 
-    Every metrics-dict value is a list[torch.Tensor] (variable-length tensors) with shapes exactly the same
-    as train_log_probs, rollout_log_probs, and loss_masks.
+    Every metrics-dict value is a list[torch.Tensor] with shapes exactly the same as log_probs.
 
     All metrics will be aggregated and averaged by `sum_of_sample_mean` and divided by DP size automatically
     - If calculate_per_token_loss=False (default), the final results will first be averaged in each sequence,
@@ -49,18 +48,18 @@ def metrics_append(metrics: Dict[str, list[torch.Tensor]], key: str, value: torc
 
 
 def calculate_veto_mask(
-    log_ratio_for_metrics: torch.Tensor,
+    log_ratio: torch.Tensor,
     loss_mask: torch.Tensor,
     veto_threshold: Optional[float],
     metrics: Dict[str, list[torch.Tensor]],
 ) -> torch.Tensor:
     if veto_threshold is None:
-        return torch.ones_like(log_ratio_for_metrics)
-    log_veto_threshold = torch.log(torch.tensor(veto_threshold, device=log_ratio_for_metrics.device))
+        return torch.ones_like(log_ratio)
+    log_veto_threshold = torch.log(torch.tensor(veto_threshold, device=log_ratio.device))
     # For each sequence, if it has any catastrophic tokens, return 0 for the sequence
-    catastrophic_tokens = ((log_ratio_for_metrics < log_veto_threshold)) & loss_mask.bool()
+    catastrophic_tokens = ((log_ratio < log_veto_threshold)) & loss_mask.bool()
     has_catastrophic = catastrophic_tokens.any()
-    veto_mask = (~has_catastrophic).float().expand_as(log_ratio_for_metrics)
+    veto_mask = (~has_catastrophic).float().expand_as(log_ratio)
 
     metrics_append(metrics, "catastrophic_token_fraction", catastrophic_tokens.int())
     metrics_append(metrics, "catastrophic_seq_fraction", has_catastrophic.int().expand_as(loss_mask))
@@ -108,19 +107,19 @@ def compute_train_infer_is_weights(
     train_log_probs: list[torch.Tensor],
     rollout_log_probs: list[torch.Tensor],
     loss_masks: list[torch.Tensor],
-) -> Tuple[list[torch.Tensor], Dict[str, Any]]:
+) -> Tuple[list[torch.Tensor], Dict[str, list[torch.Tensor]]]:
     """
     Compute the truncated importance sampling (TIS) weights and metrics.
     Args:
-        train_log_probs: List of log probs from training backend (1D tensor)
-        rollout_log_probs: List of log probs from inference backend (1D tensor)
-        loss_masks: List of loss masks (1D tensor)
-            Note that for single turn RL, the loss_mask is [1] * response_length for each sequence (1D tensor)
+        train_log_probs: List of log probs from training backend. 1D tensor each.
+        rollout_log_probs: List of log probs from inference backend. 1D tensor each.
+        loss_masks: List of loss masks. 1D tensor each.
+            Note that for single turn RL, the loss_mask is [1] * response_length tensor for each sequence
             For multi turn RL, the tool response will be marked as 0 in the loss_mask.
 
     Returns:
-        weights: List of importance sampling weights (1D tensor)
-        metrics: The metrics for the importance sampling weights.
+        weights: List of importance sampling weights. 1D tensor each.
+        metrics: The metrics for the importance sampling weights, a dict of list[torch.Tensor]. 1D tensor each.
     """
 
     level: str = args.train_infer_is_level
@@ -129,14 +128,14 @@ def compute_train_infer_is_weights(
     # Validate input lists have same length and each sequence has matching shapes
     assert (
         len(train_log_probs) == len(rollout_log_probs) == len(loss_masks)
-    ), f"Input lists must have same length: {len(train_log_probs)} vs {len(rollout_log_probs)} vs {len(loss_masks)}"
+    ), f"Input lists must have the same number of sequences: {len(train_log_probs)} vs {len(rollout_log_probs)} vs {len(loss_masks)}"
 
     for i, (train, rollout, loss_mask) in enumerate(zip(train_log_probs, rollout_log_probs, loss_masks)):
         assert (
             train.shape == rollout.shape == loss_mask.shape
         ), f"Sequence {i}: shapes must match - train: {train.shape}, rollout: {rollout.shape}, loss_mask: {loss_mask.shape}"
 
-    SAFETY_BOUND = 20.0
+    SAFETY_BOUND = 20.0  # Add a safety bound to avoid exp overflow
     all_weights = []
 
     # handle each sequence independently
@@ -149,11 +148,11 @@ def compute_train_infer_is_weights(
             # Per-token ratio (biased)
             log_ratio_for_metrics = raw_log_ratio
         elif level == "sequence":
-            # Product of ratios (unbiased)
+            # Product of ratios (unbiased but high variance)
             agg_log_ratio = (raw_log_ratio * loss_mask).sum()
             log_ratio_for_metrics = agg_log_ratio.expand_as(raw_log_ratio)
         elif level == "geometric":
-            # Geometric mean of ratios (experimental)
+            # Geometric mean of ratios (experimental but low variance)
             agg_log_ratio = (raw_log_ratio * loss_mask).sum() / torch.clamp_min(loss_mask.sum(), 1)
             log_ratio_for_metrics = agg_log_ratio.expand_as(raw_log_ratio)
         else:
@@ -215,18 +214,19 @@ def compute_train_infer_is_weights_with_cp(
     loss_masks: list[torch.Tensor],
     total_lengths: list[int],
     response_lengths: list[int],
-) -> Tuple[list[torch.Tensor], Dict[str, Any]]:
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """
     Compute the truncated importance sampling (TIS) weights and metrics with context parallel.
     Args:
-        train_log_probs: List of log probs from training backend on this cp rank (1D tensor)
-        rollout_log_probs: List of log probs from inference backend on this cp rank (1D tensor)
-        loss_masks: List of loss masks (1D tensor)
+        train_log_probs: List of log probs from training backend on this cp rank. 1D tensor each.
+        rollout_log_probs: List of log probs from inference backend on this cp rank. 1D tensor each.
+        loss_masks: List of loss masks. 1D tensor each.
         total_lengths: List of total lengths.
         response_lengths: List of response lengths.
     Returns:
-        is_weights: The importance sampling weights. [batch_size, seq_len]
-        is_metrics: The metrics for the importance sampling weights.
+        is_weights: Importance sampling weights on this CP rank and flattened along dim=0.
+        is_metrics: The metrics for the importance sampling weights, a dict of list[torch.Tensor]. 1D tensor each.
+                    Also flattened along dim=0.
     """
     # Gather cp slice from other cp ranks
     full_rollout_log_probs = [
@@ -246,11 +246,10 @@ def compute_train_infer_is_weights_with_cp(
         loss_masks=loss_masks,
     )
 
-    # Slice cp slice and concat to the full response tensor
+    # Slice out the value shards for this CP rank and concat them into a 1D tensor along dim=0 for loss.py computation.
     def slice_cp_and_concat(
         values: list[torch.Tensor], total_lengths: list[int], response_lengths: list[int]
-    ) -> list[torch.Tensor]:
-        # reshape value to the sequence size of the cp rank.
+    ) -> torch.Tensor:
         values = [
             # TODO: A rename of this function ?
             slice_log_prob_with_cp(values[i], total_lengths[i], response_lengths[i])
