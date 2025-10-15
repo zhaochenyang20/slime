@@ -73,7 +73,7 @@ GRPO_ARGS=(
    --entropy-coef 0.00
    --eps-clip 4e-4
 
-   --use-tis
+   --use-train-infer-is
    --use-routing-replay
 )
 

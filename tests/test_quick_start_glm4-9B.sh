@@ -76,7 +76,7 @@ GRPO_ARGS=(
    --eps-clip 0.2
    --eps-clip-high 0.28
 
-   --use-tis
+   --use-train-infer-is
    --calculate-per-token-loss
 )
 
