@@ -319,7 +319,7 @@ class FSDPTrainRayActor(TrainRayActor):
             pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, self.args.eps_clip, self.args.eps_clip_high)
 
             # Apply TIS before sample mean calculation
-            if self.args.use_tis:
+            if self.args.use_train_infer_is:
                 # Initialize TIS variables
                 tis = None
                 tis_clipfrac = None
@@ -338,7 +338,9 @@ class FSDPTrainRayActor(TrainRayActor):
                 tis = torch.exp(old_log_probs - rollout_log_probs)
                 ois = (-ppo_kl).exp()
                 tis_clip = torch.clamp(
-                    tis, min=getattr(self.args, "tis_clip_low", 0.1), max=getattr(self.args, "tis_clip", 2.0)
+                    tis,
+                    min=getattr(self.args, "train_infer_is_lower_bound", 0.1),
+                    max=getattr(self.args, "train_infer_is_upper_bound", 2.0),
                 )
                 tis_clipfrac = tis_clip != tis
 
