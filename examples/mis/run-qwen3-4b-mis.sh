@@ -9,7 +9,6 @@ pkill -9 python
 sleep 3
 pkill -9 ray
 pkill -9 python
-pkill -9 redis
 
 set -ex
 
@@ -25,15 +24,15 @@ fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-source "${SCRIPT_DIR}/models/qwen3-30B-A3B.sh"
+source "/root/slime/scripts/models/qwen3-4B.sh"
 
 CKPT_ARGS=(
-   --hf-checkpoint /root/Qwen3-30B-A3B
-   #--hf-checkpoint /root/Qwen3-30B-A3B-FP8
-   --ref-load /root/Qwen3-30B-A3B_torch_dist
-   # --load /root/Qwen3-30B-A3B_slime/
-   # --save /root/Qwen3-30B-A3B_slime/
-   # --save-interval 20
+   --hf-checkpoint /root/Qwen3-4B
+   #--hf-checkpoint /root/Qwen3-4B-FP8
+   --ref-load /root/Qwen3-4B_torch_dist
+   # --load /root/Qwen3-4B_slime/
+   --save /root/Qwen3-4B_slime/
+   --save-interval 200
 )
 
 ROLLOUT_ARGS=(
@@ -44,17 +43,17 @@ ROLLOUT_ARGS=(
    --rollout-shuffle
    --rm-type deepscaler
    --num-rollout 3000
-   --rollout-batch-size 8
-   --n-samples-per-prompt 4
+   --rollout-batch-size 32
+   --n-samples-per-prompt 8
    --rollout-max-response-len 8192
    --rollout-temperature 0.8
 
-   --global-batch-size 32
+   --global-batch-size 256
    --balance-data
 )
 
 EVAL_ARGS=(
-   # --eval-interval 20
+   --eval-interval 20
    --eval-prompt-data aime /root/aime-2024/aime-2024.jsonl
    --n-samples-per-eval-prompt 16
    --eval-max-response-len 16384
@@ -65,8 +64,8 @@ PERF_ARGS=(
    --tensor-model-parallel-size 2
    --sequence-parallel
    --pipeline-model-parallel-size 1
-   --context-parallel-size 2
-   --expert-model-parallel-size 4
+   --context-parallel-size 1
+   --expert-model-parallel-size 1
    --expert-tensor-parallel-size 1
 
    --recompute-granularity full
@@ -75,7 +74,7 @@ PERF_ARGS=(
 
    # --micro-batch-size 1
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 20480
+   --max-tokens-per-gpu 9216
 )
 
 GRPO_ARGS=(
@@ -88,15 +87,6 @@ GRPO_ARGS=(
    --eps-clip-high 0.28
 )
 
-IS_ARGS=(
-   --use-train-infer-is
-   --train-infer-is-level geometric
-   --train-infer-is-mode mask
-   --train-infer-is-lower-bound 0.5
-   --train-infer-is-upper-bound 2.0
-   --train-infer-is-veto-threshold 1e-3
-)
-
 OPTIMIZER_ARGS=(
    --optimizer adam
    --lr 1e-6
@@ -104,24 +94,18 @@ OPTIMIZER_ARGS=(
    --weight-decay 0.1
    --adam-beta1 0.9
    --adam-beta2 0.98
-
-   --optimizer-cpu-offload
-   --overlap-cpu-optimizer-d2h-h2d
-   --use-precision-aware-optimizer
 )
 
 WANDB_ARGS=(
-   --use-wandb
-   --wandb-project slime-dev
-   --wandb-group qwen3-30B-A3B-TIS
-   --wandb-run-id qwen3-30B-A3B-TIS-sequence
-   --wandb-key ${WANDB_KEY}
+   # --use-wandb
+   # --wandb-project slime-dev
+   # --wandb-group qwen3-4B-test
+   # --wandb-key ${WANDB_KEY}
 )
 
 SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine 4
+   --rollout-num-gpus-per-engine 2
    --sglang-mem-fraction-static 0.7
-   --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
 )
 
 MISC_ARGS=(
@@ -135,8 +119,13 @@ MISC_ARGS=(
    --attention-backend flash
 )
 
+CUSTOM_ARGS=(
+   --custom-config-path examples/test/test_config.yaml
+)
+
 # launch the master node of ray in container
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 4 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
 # Build the runtime environment JSON with proper variable substitution
@@ -163,4 +152,5 @@ ray job submit --address="http://127.0.0.1:8265" \
    ${PERF_ARGS[@]} \
    ${EVAL_ARGS[@]} \
    ${SGLANG_ARGS[@]} \
-   ${MISC_ARGS[@]}
+   ${MISC_ARGS[@]} \
+   ${CUSTOM_ARGS[@]}

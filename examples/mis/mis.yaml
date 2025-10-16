@@ -1,0 +1,25 @@
+# Enable importance sampling, details refer to the comments of compute_train_infer_is_weights in train_infer_is.py
+use_train_infer_is: false
+
+# Aggregation level for importance sampling weights: 
+# token: per-token
+# sequence: product over tokens
+# geometric: geometric mean
+train_infer_is_level: "token"
+
+# Handling mode for IS weights: 
+# truncate: cap to upper bound, TIS
+# mask: zero outside [lower, upper], MIS
+# clip: clip to [lower, upper], CIS
+train_infer_is_mode: "truncate"
+
+# For mask or clip mode, the lower bound of the IS weights.
+# For truncate mode, it will not be used.
+# If not set, it will be set to 1.0 / train_infer_is_upper_bound
+train_infer_is_lower_bound: 0.5
+
+# For truncate, mask, or clip mode, the upper bound of the IS weights
+train_infer_is_upper_bound: 2.0
+
+# Per-token veto threshold. If any token ratio < this, zero the entire sequence weight, the sequences won't have gradient
+train_infer_is_veto_threshold: 1e-4

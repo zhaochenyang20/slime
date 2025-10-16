@@ -86,7 +86,7 @@ GRPO_ARGS=(
    --eps-clip 1e-4
    --eps-clip-high 2e-4
 
-   --use-train-infer-is
+   --use-tis
 )
 
 OPTIMIZER_ARGS=(
