@@ -154,15 +154,6 @@ def compute_mis_weights(
         loss_mask = loss_mask.float()
         add_ppl_metrics(train_log_prob, rollout_log_prob, loss_mask, metrics)
         raw_log_ratio_diff = train_log_prob - rollout_log_prob
-        print("train_log_prob: ", train_log_prob)
-        print("max_train_log_prob: ", train_log_prob.max())
-        print("min_train_log_prob: ", train_log_prob.min())
-        print("rollout_log_prob: ", rollout_log_prob)
-        print("max_rollout_log_prob: ", rollout_log_prob.max())
-        print("min_rollout_log_prob: ", rollout_log_prob.min())
-        print("raw_log_ratio_diff: ", raw_log_ratio_diff)
-        print("max_raw_log_ratio_diff: ", raw_log_ratio_diff.max())
-        print("min_raw_log_ratio_diff: ", raw_log_ratio_diff.min())
 
         # level: The aggregation level for the importance sampling weights.
         if level == "token":
