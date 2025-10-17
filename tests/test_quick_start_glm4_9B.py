@@ -67,7 +67,7 @@ def execute():
         "--entropy-coef 0.00 "
         "--eps-clip 0.2 "
         "--eps-clip-high 0.28 "
-        "--use-train-infer-is "
+        "--use-tis "
         "--calculate-per-token-loss "
     )
 

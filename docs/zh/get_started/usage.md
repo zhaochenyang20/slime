@@ -181,7 +181,7 @@ sglang 的加载非常简单，只需要：
   - `reinforce_plus_plus` 与 `reinforce_plus_plus_baseline`（https://arxiv.org/abs/2501.03262）；
   - `ppo`（https://arxiv.org/abs/1707.06347）。
 - `--calculate-per-token-loss`：slime 中默认的方案是 per sample loss，即 `mean(sum(sample_i) / len(sample_i))`，如果需要计算 per token loss，即 `sum(sum(sample_i)) / sum(len(sample_i))`，可以开启 `--calculate-per-token-loss`；
-- `--use-train-infer-is`：如果需要开启 tis（https://fengyao.notion.site/off-policy-rl），可以开启这一设置。
+- `--use-tis`：如果需要开启 tis（https://fengyao.notion.site/off-policy-rl），可以开启这一设置。
 
 ## 自定义 rollout 函数
 
