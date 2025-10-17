@@ -16,7 +16,7 @@ from slime.utils.ppo_utils import (
     get_reinforce_plus_plus_baseline_advantages,
     get_reinforce_plus_plus_returns,
 )
-from slime.utils.train_infer_is import compute_train_infer_is_weights_with_cp
+from slime.utils.tis import compute_tis_weights
 from slime.utils.types import RolloutBatch
 
 from .cp_utils import all_gather_with_cp, get_logits_and_tokens_offset_with_cp, get_sum_of_sample_mean
@@ -419,21 +419,26 @@ def policy_loss_function(
 
     pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, args.eps_clip, args.eps_clip_high)
 
-    # Apply TIS off-policy correction using importance sampling if enabled
-    if args.use_train_infer_is:
+    # Apply off-policy correction using importance sampling if enabled
+    if args.use_tis:
         assert "rollout_log_probs" in batch, "rollout_log_probs must be provided for TIS"
-
-        is_weights, is_metrics = compute_train_infer_is_weights_with_cp(
-            args=args,
-            train_log_probs=batch["log_probs"],
-            rollout_log_probs=batch["rollout_log_probs"],
-            loss_masks=batch["loss_masks"],
-            total_lengths=total_lengths,
-            response_lengths=response_lengths,
-        )
-
         ois = (-ppo_kl).exp()
-        pg_loss = pg_loss * is_weights
+
+        tis_kwargs = {
+            "args": args,
+            "train_log_probs": batch["log_probs"],
+            "rollout_log_probs": batch["rollout_log_probs"],
+            "loss_masks": batch["loss_masks"],
+            "total_lengths": total_lengths,
+            "response_lengths": response_lengths,
+        }
+        if args.custom_tis_function_path is not None:
+            tis_func = load_function(args.custom_tis_function_path)
+            tis_weights, tis_metrics = tis_func(**tis_kwargs)
+        else:
+            tis_weights, tis_metrics = compute_tis_weights(**tis_kwargs)
+
+        pg_loss = pg_loss * tis_weights
 
     pg_loss = sum_of_sample_mean(pg_loss)
     pg_clipfrac = sum_of_sample_mean(pg_clipfrac)
@@ -473,11 +478,10 @@ def policy_loss_function(
     if args.use_kl_loss:
         reported_loss["kl_loss"] = kl_loss.clone().detach()
 
-    if args.use_train_infer_is:
-        # Backward compatible basic logs
+    if args.use_tis:
         reported_loss["ois"] = sum_of_sample_mean(ois).clone().detach()
-        for metric_key, metric_value in is_metrics.items():
-            key_name = f"train_infer_{metric_key}"
+        for metric_key, metric_value in tis_metrics.items():
+            key_name = f"{metric_key}"
             reported_loss[key_name] = sum_of_sample_mean(metric_value)
 
     return loss, reported_loss

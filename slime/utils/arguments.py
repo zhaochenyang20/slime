@@ -26,67 +26,6 @@ def reset_arg(parser, name, **kwargs):
         parser.add_argument(name, **kwargs)
 
 
-def add_is_arguments(parser: argparse.ArgumentParser):
-    # Off-Policy Correction arguments for importance sampling
-    # training/inference importance sampling
-    parser.add_argument(
-        "--use-train-infer-is",
-        action="store_true",
-        default=False,
-        help=(
-            "Enable importance sampling, details refer to the comments of compute_train_infer_is_weights "
-            "in train_infer_is.py"
-        ),
-    )
-    parser.add_argument(
-        "--train-infer-is-level",
-        type=str,
-        choices=["token", "sequence", "geometric"],
-        default="token",
-        help=(
-            "Aggregation level for importance sampling weights: token (per-token), "
-            "sequence (product over tokens), geometric (geometric mean)."
-        ),
-    )
-    parser.add_argument(
-        "--train-infer-is-mode",
-        type=str,
-        choices=["truncate", "mask", "clip"],
-        default="truncate",
-        help=(
-            "Handling mode for IS weights:"
-            "truncate (cap to upper bound, TIS),"
-            "mask (zero outside [lower, upper], MIS),"
-            "clip (clip to [lower, upper], CIS)."
-        ),
-    )
-    parser.add_argument(
-        "--train-infer-is-lower-bound",
-        type=float,
-        default=None,
-        help=(
-            "For mask or clip mode, the lower bound of the IS weights. For truncate mode, it will not be used. "
-            "If not set, it will be set to 1.0 / train_infer_is_upper_bound."
-        ),
-    )
-    parser.add_argument(
-        "--train-infer-is-upper-bound",
-        type=float,
-        default=2.0,
-        help=("For truncate, mask, or clip mode, the upper bound of the IS weights."),
-    )
-    parser.add_argument(
-        "--train-infer-is-veto-threshold",
-        type=float,
-        default=None,
-        help=(
-            "Per-token veto threshold. If any token ratio < this, zero the entire sequence weight, the sequences won't have gradient."
-        ),
-    )
-
-    return parser
-
-
 def get_slime_extra_args_provider(add_custom_arguments=None):
     def add_slime_arguments(parser):
         # Ray
@@ -736,6 +675,31 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "This is useful for doing special loss mask."
                 ),
             )
+            # Off-Policy Correction using Importance Sampling: https://fengyao.notion.site/off-policy-rl
+            parser.add_argument(
+                "--use-tis",
+                action="store_true",
+                default=False,
+                help="Enable TIS from https://fengyao.notion.site/off-policy-rl for off-policy importance sampling.",
+            )
+            parser.add_argument(
+                "--tis-clip",
+                type=float,
+                default=2.0,
+                help="Clipping threshold C for importance sampling ratios to control variance.",
+            )
+            parser.add_argument(
+                "--tis-clip-low",
+                type=float,
+                default=0,
+                help="Lower bound clipping threshold C for importance sampling ratios to control variance.",
+            )
+            parser.add_argument(
+                "--custom-tis-function-path",
+                type=str,
+                default=None,
+                help="Path to the custom TIS function.",
+            )
 
             parser.add_argument(
                 "--use-routing-replay",
@@ -1047,7 +1011,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         parser = add_reward_model_arguments(parser)
         parser = add_rollout_buffer_arguments(parser)
         parser = add_ci_arguments(parser)
-        parser = add_is_arguments(parser)
         parser.set_defaults(sglang_tensor_parallel_size=add_sglang_tp_size())
 
         # For megatron
@@ -1187,10 +1150,6 @@ def slime_validate_args(args):
 
     if args.eps_clip_high is None:
         args.eps_clip_high = args.eps_clip
-
-    if args.use_train_infer_is:
-        if args.train_infer_is_lower_bound is None:
-            args.train_infer_is_lower_bound = 1.0 / args.train_infer_is_upper_bound
 
     if args.eval_reward_key is None:
         args.eval_reward_key = args.reward_key
