@@ -1,4 +1,4 @@
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 
@@ -109,7 +109,7 @@ def mask(
     return weights * mask * loss_mask
 
 
-def compute_train_infer_is_weights(
+def compute_mis_weights(
     args,
     *,
     train_log_probs: list[torch.Tensor],
@@ -130,8 +130,11 @@ def compute_train_infer_is_weights(
         metrics: The metrics for the importance sampling weights, a dict of list[torch.Tensor]. 1D tensor each.
     """
 
-    level: str = args.train_infer_is_level
+    level: str = args.mis_level
     metrics: Dict[str, list[torch.Tensor]] = {}
+
+    if args.mis_lower_bound is None:
+        return 1.0 / args.mis_upper_bound
 
     # Validate input lists have same length and each sequence has matching shapes
     assert (
@@ -151,6 +154,15 @@ def compute_train_infer_is_weights(
         loss_mask = loss_mask.float()
         add_ppl_metrics(train_log_prob, rollout_log_prob, loss_mask, metrics)
         raw_log_ratio_diff = train_log_prob - rollout_log_prob
+        print("train_log_prob: ", train_log_prob)
+        print("max_train_log_prob: ", train_log_prob.max())
+        print("min_train_log_prob: ", train_log_prob.min())
+        print("rollout_log_prob: ", rollout_log_prob)
+        print("max_rollout_log_prob: ", rollout_log_prob.max())
+        print("min_rollout_log_prob: ", rollout_log_prob.min())
+        print("raw_log_ratio_diff: ", raw_log_ratio_diff)
+        print("max_raw_log_ratio_diff: ", raw_log_ratio_diff.max())
+        print("min_raw_log_ratio_diff: ", raw_log_ratio_diff.min())
 
         # level: The aggregation level for the importance sampling weights.
         if level == "token":
@@ -170,39 +182,39 @@ def compute_train_infer_is_weights(
         metrics_append(metrics, "mean_is_weight_before_clip", weights)
 
         # mask out catastrophic tokens
-        if args.train_infer_is_veto_threshold is not None:
-            veto_mask = calculate_veto_mask(raw_log_ratio_diff, loss_mask, args.train_infer_is_veto_threshold, metrics)
+        if args.mis_veto_threshold is not None:
+            veto_mask = calculate_veto_mask(raw_log_ratio_diff, loss_mask, args.mis_veto_threshold, metrics)
 
         # mode: how to handle the importance sampling weights exceeding the thresholds.
-        if args.train_infer_is_mode == "truncate":
+        if args.mis_mode == "truncate":
             # Cap the importance sampling weights at the upper threshold
             # https://fengyao.notion.site/off-policy-rl#279721e3f6c48092bbe2fcfe0e9c6b33
-            weights = truncate(weights, loss_mask, metrics, args.train_infer_is_upper_bound)
-        elif args.train_infer_is_mode == "mask":
+            weights = truncate(weights, loss_mask, metrics, args.mis_upper_bound)
+        elif args.mis_mode == "mask":
             # Zero the importance sampling weights outside the [lower, upper] range.
             # https://yingru.notion.site/When-Speed-Kills-Stability-Demystifying-RL-Collapse-from-the-Training-Inference-Mismatch-271211a558b7808d8b12d403fd15edda
             weights = mask(
                 weights,
                 loss_mask,
                 metrics,
-                args.train_infer_is_lower_bound,
-                args.train_infer_is_upper_bound,
+                args.mis_lower_bound,
+                args.mis_upper_bound,
             )
-        elif args.train_infer_is_mode == "clip":
+        elif args.mis_mode == "clip":
             # Clip the importance sampling weights to the [lower, upper] range.
             # Original behavior in slime.
             weights = clip(
                 weights,
                 loss_mask,
                 metrics,
-                args.train_infer_is_lower_bound,
-                args.train_infer_is_upper_bound,
+                args.mis_lower_bound,
+                args.mis_upper_bound,
             )
         else:
-            raise ValueError(f"Unsupported train_infer_is_mode: {args.train_infer_is_mode}")
+            raise ValueError(f"Unsupported mis_mode: {args.mis_mode}")
 
-        metrics_append(metrics, "ratio_mean_after_tis", weights)
-        if args.train_infer_is_veto_threshold is not None:
+        metrics_append(metrics, "ratio_mean_after_mis", weights)
+        if args.mis_veto_threshold is not None:
             weights = weights * veto_mask
             metrics_append(metrics, "ratio_mean_after_veto_mask", weights)
 
@@ -212,7 +224,7 @@ def compute_train_infer_is_weights(
     return all_weights, metrics
 
 
-def compute_train_infer_is_weights_with_cp(
+def compute_mis_weights_with_cp(
     args,
     *,
     train_log_probs: list[torch.Tensor],
@@ -220,9 +232,10 @@ def compute_train_infer_is_weights_with_cp(
     loss_masks: list[torch.Tensor],
     total_lengths: list[int],
     response_lengths: list[int],
+    **kwargs: Any,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """
-    Compute the truncated importance sampling (TIS) weights and metrics with context parallel.
+    Compute the importance sampling (IS) weights and metrics with context parallel.
     Args:
         train_log_probs: List of log probs from training backend on this cp rank. 1D tensor each. Lengths can be different.
         rollout_log_probs: List of log probs from inference backend on this cp rank. 1D tensor each.
@@ -245,7 +258,7 @@ def compute_train_infer_is_weights_with_cp(
     ]
 
     # Main logic for is
-    is_weights, is_metrics = compute_train_infer_is_weights(
+    is_weights, is_metrics = compute_mis_weights(
         args=args,
         train_log_probs=full_old_log_probs,
         rollout_log_probs=full_rollout_log_probs,
@@ -263,12 +276,14 @@ def compute_train_infer_is_weights_with_cp(
         ]
         return torch.cat(values, dim=0)
 
+    result_metrics = {}
     is_weights = slice_cp_and_concat(is_weights, total_lengths, response_lengths)
     for key, values in is_metrics.items():
+        key_name = f"mis_{key}"
         values = slice_cp_and_concat(values, total_lengths, response_lengths)
-        is_metrics[key] = values
+        result_metrics[key_name] = values
 
-    return is_weights, is_metrics
+    return is_weights, result_metrics
 
 
 def add_ppl_metrics(
@@ -314,8 +329,6 @@ def add_ppl_metrics(
     log_ppl_diff = mean_log_prob_rollout - mean_log_prob_training
     metrics_append(metrics, "log_ppl_diff", log_ppl_diff)
     metrics_append(metrics, "log_ppl_abs_diff", log_ppl_diff.abs())
-    metrics_append(metrics, "log_ppl_diff_max", log_ppl_diff)
-    metrics_append(metrics, "log_ppl_diff_min", log_ppl_diff)
 
     # 3d. PPL ratio (how much higher is training PPL vs rollout PPL)
     # For numerical stability, compute in log space using log_ppl_diff
