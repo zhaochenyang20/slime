@@ -16,7 +16,6 @@ from slime.utils.ppo_utils import (
     get_reinforce_plus_plus_baseline_advantages,
     get_reinforce_plus_plus_returns,
 )
-from slime.utils.tis import compute_tis_weights
 from slime.utils.types import RolloutBatch
 
 from .cp_utils import all_gather_with_cp, get_logits_and_tokens_offset_with_cp, get_sum_of_sample_mean
@@ -422,21 +421,30 @@ def policy_loss_function(
     # Apply off-policy correction using importance sampling if enabled
     if args.use_tis:
         assert "rollout_log_probs" in batch, "rollout_log_probs must be provided for TIS"
-        ois = (-ppo_kl).exp()
 
-        tis_kwargs = {
-            "args": args,
-            "train_log_probs": batch["log_probs"],
-            "rollout_log_probs": batch["rollout_log_probs"],
-            "loss_masks": batch["loss_masks"],
-            "total_lengths": total_lengths,
-            "response_lengths": response_lengths,
-        }
+        ois = (-ppo_kl).exp()
         if args.custom_tis_function_path is not None:
+            tis_kwargs = {
+                "args": args,
+                "train_log_probs": batch["log_probs"],
+                "rollout_log_probs": batch["rollout_log_probs"],
+                "loss_masks": batch["loss_masks"],
+                "total_lengths": total_lengths,
+                "response_lengths": response_lengths,
+            }
             tis_func = load_function(args.custom_tis_function_path)
             tis_weights, tis_metrics = tis_func(**tis_kwargs)
         else:
-            tis_weights, tis_metrics = compute_tis_weights(**tis_kwargs)
+            rollout_log_probs = torch.cat(batch["rollout_log_probs"], dim=0)
+            old_log_probs = torch.cat(batch["log_probs"], dim=0)
+            tis = torch.exp(old_log_probs - rollout_log_probs)
+            tis_weights = torch.clamp(tis, min=args.tis_clip_low, max=args.tis_clip)
+            tis_clipfrac = (tis_weights != tis).float()
+
+            tis_metrics = {
+                "tis": tis.clone().detach(),
+                "tis_clipfrac": tis_clipfrac.clone().detach(),
+            }
 
         pg_loss = pg_loss * tis_weights
 
@@ -480,6 +488,7 @@ def policy_loss_function(
 
     if args.use_tis:
         reported_loss["ois"] = sum_of_sample_mean(ois).clone().detach()
+        # Assume all metrics are already cloned and detached
         for metric_key, metric_value in tis_metrics.items():
             key_name = f"{metric_key}"
             reported_loss[key_name] = sum_of_sample_mean(metric_value)
